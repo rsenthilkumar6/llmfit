@@ -124,6 +124,8 @@ pub struct LlmModel {
     pub active_experts: Option<u32>,
     #[serde(default)]
     pub active_parameters: Option<u64>,
+    #[serde(default)]
+    pub release_date: Option<String>,
 }
 
 impl LlmModel {
@@ -247,6 +249,8 @@ struct HfModelEntry {
     active_experts: Option<u32>,
     #[serde(default)]
     active_parameters: Option<u64>,
+    #[serde(default)]
+    release_date: Option<String>,
 }
 
 const HF_MODELS_JSON: &str = include_str!("../data/hf_models.json");
@@ -283,6 +287,7 @@ impl ModelDatabase {
                 num_experts: e.num_experts,
                 active_experts: e.active_experts,
                 active_parameters: e.active_parameters,
+                release_date: e.release_date,
             })
             .collect();
 
@@ -373,6 +378,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
 
         // Large budget should return mlx-8bit (best in MLX hierarchy)
@@ -440,6 +446,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
         assert_eq!(model.params_b(), 7.0);
     }
@@ -461,6 +468,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
         assert_eq!(model.params_b(), 13.0);
     }
@@ -482,6 +490,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
         assert_eq!(model.params_b(), 0.5);
     }
@@ -503,6 +512,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
 
         let mem = model.estimate_memory_gb("Q4_K_M", 4096);
@@ -532,6 +542,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
 
         // Large budget should return best quant
@@ -567,6 +578,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
         assert!(dense_model.moe_active_vram_gb().is_none());
 
@@ -586,6 +598,7 @@ mod tests {
             num_experts: Some(8),
             active_experts: Some(2),
             active_parameters: Some(12_900_000_000),
+            release_date: None,
         };
         let vram = moe_model.moe_active_vram_gb();
         assert!(vram.is_some());
@@ -613,6 +626,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
         assert!(dense_model.moe_offloaded_ram_gb().is_none());
 
@@ -632,6 +646,7 @@ mod tests {
             num_experts: Some(8),
             active_experts: Some(2),
             active_parameters: Some(12_900_000_000),
+            release_date: None,
         };
         let offloaded = moe_model.moe_offloaded_ram_gb();
         assert!(offloaded.is_some());
@@ -661,6 +676,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
         assert_eq!(UseCase::from_model(&model), UseCase::Coding);
     }
@@ -682,6 +698,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
         assert_eq!(UseCase::from_model(&model), UseCase::Embedding);
     }
@@ -703,6 +720,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
         assert_eq!(UseCase::from_model(&model), UseCase::Reasoning);
     }

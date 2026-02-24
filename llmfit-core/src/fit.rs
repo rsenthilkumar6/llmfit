@@ -25,6 +25,7 @@ pub enum SortColumn {
     Params,
     MemPct,
     Ctx,
+    ReleaseDate,
     UseCase,
 }
 
@@ -35,6 +36,7 @@ impl SortColumn {
             SortColumn::Params => "Params",
             SortColumn::MemPct => "Mem%",
             SortColumn::Ctx => "Ctx",
+            SortColumn::ReleaseDate => "Date",
             SortColumn::UseCase => "Use",
         }
     }
@@ -44,7 +46,8 @@ impl SortColumn {
             SortColumn::Score => SortColumn::Params,
             SortColumn::Params => SortColumn::MemPct,
             SortColumn::MemPct => SortColumn::Ctx,
-            SortColumn::Ctx => SortColumn::UseCase,
+            SortColumn::Ctx => SortColumn::ReleaseDate,
+            SortColumn::ReleaseDate => SortColumn::UseCase,
             SortColumn::UseCase => SortColumn::Score,
         }
     }
@@ -577,6 +580,28 @@ pub fn rank_models_by_fit_opts_col(
                 .partial_cmp(&a.utilization_pct)
                 .unwrap_or(std::cmp::Ordering::Equal),
             SortColumn::Ctx => b.model.context_length.cmp(&a.model.context_length),
+            SortColumn::ReleaseDate => {
+                let a_date = a.model.release_date.as_deref().unwrap_or("");
+                let b_date = b.model.release_date.as_deref().unwrap_or("");
+                match (a_date.is_empty(), b_date.is_empty()) {
+                    (true, false) => std::cmp::Ordering::Greater, // no date = last
+                    (false, true) => std::cmp::Ordering::Less,
+                    (true, true) => b
+                        .score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                    (false, false) => {
+                        let cmp = b_date.cmp(a_date); // descending = newest first
+                        if cmp == std::cmp::Ordering::Equal {
+                            b.score
+                                .partial_cmp(&a.score)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        } else {
+                            cmp
+                        }
+                    }
+                }
+            }
             SortColumn::UseCase => {
                 let cmp = a.use_case.label().cmp(b.use_case.label());
                 if cmp == std::cmp::Ordering::Equal {
@@ -838,6 +863,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         }
     }
 
@@ -1010,6 +1036,7 @@ mod tests {
             num_experts: Some(8),
             active_experts: Some(2),
             active_parameters: Some(12_900_000_000),
+            release_date: None,
         };
         let mut system = test_system(64.0, true, Some(8.0));
         system.backend = GpuBackend::Cuda;
@@ -1039,6 +1066,7 @@ mod tests {
             num_experts: None,
             active_experts: None,
             active_parameters: None,
+            release_date: None,
         };
         let system = test_system(12.0, true, Some(8.0));
 
@@ -1332,5 +1360,39 @@ mod tests {
         // All should be positive
         assert!(tps_gpu > 0.0);
         assert!(tps_cpu > 0.0);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Release date sorting tests
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sort_by_release_date() {
+        let system = test_system(32.0, true, Some(16.0));
+
+        let mut model_new = test_model("7B", 4.0, Some(4.0));
+        model_new.name = "New Model".to_string();
+        model_new.release_date = Some("2025-06-15".to_string());
+
+        let mut model_old = test_model("7B", 4.0, Some(4.0));
+        model_old.name = "Old Model".to_string();
+        model_old.release_date = Some("2024-01-10".to_string());
+
+        let mut model_none = test_model("7B", 4.0, Some(4.0));
+        model_none.name = "No Date Model".to_string();
+        model_none.release_date = None;
+
+        let fits = vec![
+            ModelFit::analyze(&model_old, &system),
+            ModelFit::analyze(&model_none, &system),
+            ModelFit::analyze(&model_new, &system),
+        ];
+
+        let ranked = rank_models_by_fit_opts_col(fits, false, SortColumn::ReleaseDate);
+
+        // Newest first, no-date last
+        assert_eq!(ranked[0].model.name, "New Model");
+        assert_eq!(ranked[1].model.name, "Old Model");
+        assert_eq!(ranked[2].model.name, "No Date Model");
     }
 }

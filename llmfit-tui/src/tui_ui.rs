@@ -307,18 +307,19 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
     let sort_col = app.sort_column;
     let header_names = [
         "", "Inst", "Model", "Provider", "Params", "Score", "tok/s", "Quant", "Mode", "Mem %",
-        "Ctx", "Fit", "Use Case",
+        "Ctx", "Date", "Fit", "Use Case",
     ];
     // Column indices that correspond to each SortColumn variant
-    let sort_col_idx = match sort_col {
-        SortColumn::Score => 5,
-        SortColumn::Params => 4,
-        SortColumn::MemPct => 9,
-        SortColumn::Ctx => 10,
-        SortColumn::UseCase => 12,
+    let sort_col_idx: Option<usize> = match sort_col {
+        SortColumn::Score => Some(5),
+        SortColumn::Params => Some(4),
+        SortColumn::MemPct => Some(9),
+        SortColumn::Ctx => Some(10),
+        SortColumn::ReleaseDate => Some(11),
+        SortColumn::UseCase => Some(13),
     };
     let header_cells = header_names.iter().enumerate().map(|(i, h)| {
-        if i == sort_col_idx {
+        if sort_col_idx == Some(i) {
             Cell::from(format!("{} ▼", h)).style(
                 Style::default()
                     .fg(Color::Yellow)
@@ -410,6 +411,15 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
                     .style(Style::default().fg(color)),
                 Cell::from(format!("{}k", fit.model.context_length / 1000))
                     .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(
+                    fit.model
+                        .release_date
+                        .as_deref()
+                        .and_then(|d| d.get(..7))
+                        .unwrap_or("\u{2014}")
+                        .to_string(),
+                )
+                .style(Style::default().fg(Color::DarkGray)),
                 Cell::from(fit.fit_text().to_string()).style(Style::default().fg(color)),
                 Cell::from(fit.use_case.label().to_string())
                     .style(Style::default().fg(Color::DarkGray)),
@@ -430,6 +440,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(7),  // mode
         Constraint::Length(6),  // mem %
         Constraint::Length(5),  // ctx
+        Constraint::Length(8),  // date (YYYY-MM)
         Constraint::Length(10), // fit
         Constraint::Min(10),    // use case
     ];
@@ -536,6 +547,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("  Category:    ", Style::default().fg(Color::DarkGray)),
             Span::styled(fit.use_case.label(), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Released:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                fit.model.release_date.as_deref().unwrap_or("Unknown"),
+                Style::default().fg(Color::White),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  Runtime:     ", Style::default().fg(Color::DarkGray)),
