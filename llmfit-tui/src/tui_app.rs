@@ -1,6 +1,6 @@
 use llmfit_core::fit::{FitLevel, ModelFit, SortColumn, backend_compatible};
 use llmfit_core::hardware::SystemSpecs;
-use llmfit_core::models::ModelDatabase;
+use llmfit_core::models::{ModelDatabase, UseCase};
 use llmfit_core::plan::{PlanEstimate, PlanRequest, estimate_model_plan};
 use llmfit_core::providers::{
     self, LlamaCppProvider, MlxProvider, ModelProvider, OllamaProvider, PullEvent, PullHandle,
@@ -17,6 +17,7 @@ pub enum InputMode {
     Search,
     Plan,
     ProviderPopup,
+    UseCasePopup,
     DownloadProviderPopup,
 }
 
@@ -149,6 +150,8 @@ pub struct App {
     pub filtered_fits: Vec<usize>, // indices into all_fits
     pub providers: Vec<String>,
     pub selected_providers: Vec<bool>,
+    pub use_cases: Vec<UseCase>,
+    pub selected_use_cases: Vec<bool>,
 
     // Filters
     pub fit_filter: FitFilter,
@@ -173,6 +176,7 @@ pub struct App {
 
     // Provider popup
     pub provider_cursor: usize,
+    pub use_case_cursor: usize,
     pub download_provider_cursor: usize,
     pub download_provider_options: Vec<DownloadProvider>,
     pub download_provider_model: Option<String>,
@@ -269,6 +273,18 @@ impl App {
         model_providers.sort();
 
         let selected_providers = vec![true; model_providers.len()];
+        let model_use_cases = [
+            UseCase::General,
+            UseCase::Coding,
+            UseCase::Reasoning,
+            UseCase::Chat,
+            UseCase::Multimodal,
+            UseCase::Embedding,
+        ]
+        .into_iter()
+        .filter(|uc| all_fits.iter().any(|f| f.use_case == *uc))
+        .collect::<Vec<_>>();
+        let selected_use_cases = vec![true; model_use_cases.len()];
 
         let filtered_count = all_fits.len();
 
@@ -284,6 +300,8 @@ impl App {
             filtered_fits: (0..filtered_count).collect(),
             providers: model_providers,
             selected_providers,
+            use_cases: model_use_cases,
+            selected_use_cases,
             fit_filter: FitFilter::All,
             availability_filter: AvailabilityFilter::All,
             installed_first: false,
@@ -300,6 +318,7 @@ impl App {
             plan_estimate: None,
             plan_error: None,
             provider_cursor: 0,
+            use_case_cursor: 0,
             download_provider_cursor: 0,
             download_provider_options: Vec::new(),
             download_provider_model: None,
@@ -349,11 +368,12 @@ impl App {
                 } else {
                     // Combine all searchable fields into one string
                     let searchable = format!(
-                        "{} {} {} {}",
+                        "{} {} {} {} {}",
                         fit.model.name.to_lowercase(),
                         fit.model.provider.to_lowercase(),
                         fit.model.parameter_count.to_lowercase(),
-                        fit.model.use_case.to_lowercase()
+                        fit.model.use_case.to_lowercase(),
+                        fit.use_case.label().to_lowercase()
                     );
                     // All terms must be present (AND logic)
                     terms.iter().all(|term| searchable.contains(term))
@@ -363,6 +383,10 @@ impl App {
                 let provider_idx = self.providers.iter().position(|p| p == &fit.model.provider);
                 let matches_provider = provider_idx
                     .map(|idx| self.selected_providers[idx])
+                    .unwrap_or(true);
+                let use_case_idx = self.use_cases.iter().position(|uc| *uc == fit.use_case);
+                let matches_use_case = use_case_idx
+                    .map(|idx| self.selected_use_cases[idx])
                     .unwrap_or(true);
 
                 // Hide MLX-only models on non-Apple Silicon systems
@@ -390,7 +414,11 @@ impl App {
                     AvailabilityFilter::Installed => fit.installed,
                 };
 
-                matches_search && matches_provider && matches_fit && matches_availability
+                matches_search
+                    && matches_provider
+                    && matches_use_case
+                    && matches_fit
+                    && matches_availability
             })
             .map(|(i, _)| i)
             .collect();
@@ -705,6 +733,15 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
+    pub fn open_use_case_popup(&mut self) {
+        self.input_mode = InputMode::UseCasePopup;
+        // Don't reset cursor -- keep it where it was last time
+    }
+
+    pub fn close_use_case_popup(&mut self) {
+        self.input_mode = InputMode::Normal;
+    }
+
     pub fn provider_popup_up(&mut self) {
         if self.provider_cursor > 0 {
             self.provider_cursor -= 1;
@@ -729,6 +766,35 @@ impl App {
         let all_selected = self.selected_providers.iter().all(|&s| s);
         let new_val = !all_selected;
         for s in &mut self.selected_providers {
+            *s = new_val;
+        }
+        self.apply_filters();
+    }
+
+    pub fn use_case_popup_up(&mut self) {
+        if self.use_case_cursor > 0 {
+            self.use_case_cursor -= 1;
+        }
+    }
+
+    pub fn use_case_popup_down(&mut self) {
+        if self.use_case_cursor + 1 < self.use_cases.len() {
+            self.use_case_cursor += 1;
+        }
+    }
+
+    pub fn use_case_popup_toggle(&mut self) {
+        if self.use_case_cursor < self.selected_use_cases.len() {
+            self.selected_use_cases[self.use_case_cursor] =
+                !self.selected_use_cases[self.use_case_cursor];
+            self.apply_filters();
+        }
+    }
+
+    pub fn use_case_popup_select_all(&mut self) {
+        let all_selected = self.selected_use_cases.iter().all(|&s| s);
+        let new_val = !all_selected;
+        for s in &mut self.selected_use_cases {
             *s = new_val;
         }
         self.apply_filters();

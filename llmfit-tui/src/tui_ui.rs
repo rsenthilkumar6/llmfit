@@ -50,9 +50,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_status_bar(frame, app, outer[3], &tc);
 
-    // Draw provider popup on top if active
+    // Draw popup overlays on top if active
     if app.input_mode == InputMode::ProviderPopup {
         draw_provider_popup(frame, app, &tc);
+    } else if app.input_mode == InputMode::UseCasePopup {
+        draw_use_case_popup(frame, app, &tc);
     } else if app.input_mode == InputMode::DownloadProviderPopup {
         draw_download_provider_popup(frame, app, &tc);
     }
@@ -201,7 +203,8 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(30),    // search
-            Constraint::Length(24), // provider summary
+            Constraint::Length(18), // provider summary
+            Constraint::Length(18), // use-case summary
             Constraint::Length(18), // sort column
             Constraint::Length(20), // fit filter
             Constraint::Length(20), // availability filter
@@ -215,6 +218,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         InputMode::Normal
         | InputMode::Plan
         | InputMode::ProviderPopup
+        | InputMode::UseCasePopup
         | InputMode::DownloadProviderPopup => Style::default().fg(tc.muted),
     };
 
@@ -272,6 +276,35 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     .block(provider_block);
     frame.render_widget(providers, chunks[1]);
 
+    // Use-case filter summary
+    let active_count = app.selected_use_cases.iter().filter(|&&s| s).count();
+    let total_count = app.use_cases.len();
+    let use_case_text = if active_count == total_count {
+        "All".to_string()
+    } else {
+        format!("{}/{}", active_count, total_count)
+    };
+    let use_case_color = if active_count == total_count {
+        tc.good
+    } else if active_count == 0 {
+        tc.error
+    } else {
+        tc.warning
+    };
+
+    let use_case_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.border))
+        .title(" Use Case (U) ")
+        .title_style(Style::default().fg(tc.muted));
+
+    let use_cases = Paragraph::new(Line::from(Span::styled(
+        format!(" {}", use_case_text),
+        Style::default().fg(use_case_color),
+    )))
+    .block(use_case_block);
+    frame.render_widget(use_cases, chunks[2]);
+
     // Sort column
     let sort_block = Block::default()
         .borders(Borders::ALL)
@@ -284,7 +317,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         Style::default().fg(tc.accent),
     )))
     .block(sort_block);
-    frame.render_widget(sort_text, chunks[2]);
+    frame.render_widget(sort_text, chunks[3]);
 
     // Fit filter
     let fit_style = match app.fit_filter {
@@ -304,7 +337,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
 
     let fit_text = Paragraph::new(Line::from(Span::styled(app.fit_filter.label(), fit_style)))
         .block(fit_block);
-    frame.render_widget(fit_text, chunks[3]);
+    frame.render_widget(fit_text, chunks[4]);
 
     // Availability filter
     let avail_style = match app.availability_filter {
@@ -324,7 +357,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         avail_style,
     )))
     .block(avail_block);
-    frame.render_widget(avail_text, chunks[4]);
+    frame.render_widget(avail_text, chunks[5]);
 
     // Theme indicator
     let theme_block = Block::default()
@@ -338,7 +371,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         Style::default().fg(tc.info),
     )))
     .block(theme_block);
-    frame.render_widget(theme_text, chunks[5]);
+    frame.render_widget(theme_text, chunks[6]);
 }
 
 fn fit_color(level: FitLevel, tc: &ThemeColors) -> Color {
@@ -1296,6 +1329,89 @@ fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     frame.render_widget(paragraph, popup_area);
 }
 
+fn draw_use_case_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
+    let area = frame.area();
+
+    let max_name_len = app
+        .use_cases
+        .iter()
+        .map(|uc| uc.label().len())
+        .max()
+        .unwrap_or(10);
+    let popup_width = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
+    let popup_height = (app.use_cases.len() as u16 + 2).min(area.height.saturating_sub(4));
+
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let inner_height = popup_height.saturating_sub(2) as usize;
+    let total = app.use_cases.len();
+
+    let scroll_offset = if app.use_case_cursor >= inner_height {
+        app.use_case_cursor - inner_height + 1
+    } else {
+        0
+    };
+
+    let lines: Vec<Line> = app
+        .use_cases
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(inner_height)
+        .map(|(i, use_case)| {
+            let checkbox = if app.selected_use_cases[i] {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let is_cursor = i == app.use_case_cursor;
+
+            let style = if is_cursor {
+                if app.selected_use_cases[i] {
+                    Style::default()
+                        .fg(tc.good)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(tc.highlight_bg)
+                } else {
+                    Style::default()
+                        .fg(tc.fg)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(tc.highlight_bg)
+                }
+            } else if app.selected_use_cases[i] {
+                Style::default().fg(tc.good)
+            } else {
+                Style::default().fg(tc.muted)
+            };
+
+            Line::from(Span::styled(
+                format!(" {} {}", checkbox, use_case.label()),
+                style,
+            ))
+        })
+        .collect();
+
+    let active_count = app.selected_use_cases.iter().filter(|&&s| s).count();
+    let title = format!(" Use Cases ({}/{}) ", active_count, total);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.accent_secondary))
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(tc.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
 fn draw_download_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     let area = frame.area();
     let popup_width = 44.min(area.width.saturating_sub(4));
@@ -1381,7 +1497,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 };
                 (
                     format!(
-                        " ↑↓/jk:nav  {}  /:search  f:fit  s:sort  t:theme  p:plan{}  P:providers  q:quit  tok/s*:est",
+                        " ↑↓/jk:nav  {}  /:search  f:fit  s:sort  t:theme  p:plan{}  P:providers  U:use cases  q:quit  tok/s*:est",
                         detail_key, ollama_keys,
                     ),
                     "NORMAL",
@@ -1399,6 +1515,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             InputMode::ProviderPopup => (
                 "  ↑↓/jk:navigate  Space:toggle  a:all/none  Esc:close".to_string(),
                 "PROVIDERS",
+            ),
+            InputMode::UseCasePopup => (
+                "  ↑↓/jk:navigate  Space:toggle  a:all/none  Esc:close".to_string(),
+                "USE CASES",
             ),
             InputMode::DownloadProviderPopup => (
                 "  ↑↓/jk:choose  Enter:download  Esc:cancel".to_string(),
@@ -1458,7 +1578,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             };
             (
                 format!(
-                    " ↑↓/jk:nav  {}  /:search  f:fit  s:sort  t:theme  p:plan{}  P:providers  q:quit  tok/s*:est",
+                    " ↑↓/jk:nav  {}  /:search  f:fit  s:sort  t:theme  p:plan{}  P:providers  U:use cases  q:quit  tok/s*:est",
                     detail_key, ollama_keys,
                 ),
                 "NORMAL",
@@ -1476,6 +1596,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         InputMode::ProviderPopup => (
             "  ↑↓/jk:navigate  Space:toggle  a:all/none  Esc:close".to_string(),
             "PROVIDERS",
+        ),
+        InputMode::UseCasePopup => (
+            "  ↑↓/jk:navigate  Space:toggle  a:all/none  Esc:close".to_string(),
+            "USE CASES",
         ),
         InputMode::DownloadProviderPopup => (
             "  ↑↓/jk:choose  Enter:download  Esc:cancel".to_string(),
