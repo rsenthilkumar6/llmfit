@@ -12,44 +12,27 @@ Ships with an interactive TUI (default) and a classic CLI mode. Supports multi-G
 
 > **Sister project:** Check out [sympozium](https://github.com/AlexsJones/sympozium/) for managing agents in Kubernetes.
 
-### Quick install (macOS / Linux)
-
-```sh
-curl -fsSL https://llmfit.axjns.dev/install.sh | sh
-```
-_Downloads the latest release binary from GitHub and installs it to `/usr/local/bin` (or `~/.local/bin`)_
-
-Or
-```sh
-brew install llmfit
-```
-
-Windows users: see the **Install** section below.
-
 ![demo](demo.gif)
 
 ---
 
 ## Install
 
-### Cargo (Windows / macOS / Linux)
-
+### Windows
 ```sh
-cargo install llmfit
+scoop install llmfit
 ```
 
-If `cargo` is not installed yet, install Rust via [rustup](https://rustup.rs/).
+If Scoop is not installed, follow the [Scoop installation guide](https://scoop.sh/).
 
 ### macOS / Linux
 
 #### Homebrew
-
 ```sh
 brew install llmfit
 ```
 
 #### Quick install
-
 ```sh
 curl -fsSL https://llmfit.axjns.dev/install.sh | sh
 ```
@@ -57,13 +40,11 @@ curl -fsSL https://llmfit.axjns.dev/install.sh | sh
 Downloads the latest release binary from GitHub and installs it to `/usr/local/bin` (or `~/.local/bin` if no sudo).
 
 **Install to `~/.local/bin` without sudo:**
-
 ```sh
 curl -fsSL https://llmfit.axjns.dev/install.sh | sh -s -- --local
 ```
 
 ### From source
-
 ```sh
 git clone https://github.com/AlexsJones/llmfit.git
 cd llmfit
