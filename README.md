@@ -87,17 +87,62 @@ Launches the interactive terminal UI. Your system specs (CPU, RAM, GPU name, VRA
 | `f` | Cycle fit filter: All, Runnable, Perfect, Good, Marginal |
 | `a` | Cycle availability filter: All, GGUF Avail, Installed |
 | `s` | Cycle sort column: Score, Params, Mem%, Ctx, Date, Use Case |
+| `v` | Enter Visual mode (select multiple models) |
+| `V` | Enter Select mode (column-based filtering) |
 | `t` | Cycle color theme (saved automatically) |
 | `p` | Open Plan mode for selected model (hardware planning) |
 | `P` | Open provider filter popup |
+| `U` | Open use-case filter popup |
+| `C` | Open capability filter popup |
+| `m` | Mark selected model for compare |
+| `c` | Open compare view (marked vs selected) |
+| `x` | Clear compare mark |
 | `i` | Toggle installed-first sorting (any detected runtime provider) |
 | `d` | Download selected model (provider picker when multiple are available) |
 | `r` | Refresh installed models from runtime providers |
-| `1`-`9` | Toggle provider visibility |
 | `Enter` | Toggle detail view for selected model |
 | `PgUp` / `PgDn` | Scroll by 10 |
 | `g` / `G` | Jump to top / bottom |
 | `q` | Quit |
+
+### Vim-like modes
+
+The TUI uses Vim-inspired modes shown in the bottom-left status bar. The current mode determines which keys are active.
+
+#### Normal mode
+
+The default mode. Navigate, search, filter, and open views. All keys in the table above apply here.
+
+#### Visual mode (`v`)
+
+Select a contiguous range of models for bulk comparison. Press `v` to anchor at the current row, then navigate with `j`/`k` or arrow keys to extend the selection. Selected rows are highlighted.
+
+| Key | Action |
+|---|---|
+| `j` / `k` or arrows | Extend selection up/down |
+| `c` | Compare all selected models (opens multi-compare view) |
+| `m` | Mark current model for two-model compare |
+| `Esc` or `v` | Exit Visual mode |
+
+The multi-compare view displays a table where rows are attributes (Score, tok/s, Fit, Mem%, Params, Mode, Context, Quant, etc.) and columns are models. Best values are highlighted. Use `h`/`l` or arrow keys to scroll horizontally if more models are selected than fit on screen.
+
+#### Select mode (`V`)
+
+Column-based filtering. Press `V` (shift-v) to enter Select mode, then use `h`/`l` or arrow keys to move between column headers. The active column is visually highlighted. Press `Enter` or `Space` to activate the appropriate filter for that column:
+
+| Column | Filter action |
+|---|---|
+| Inst | Cycle availability filter |
+| Model | Enter search mode |
+| Provider | Open provider popup |
+| Params | Open parameter-size bucket popup (<3B, 3-7B, 7-14B, 14-30B, 30-70B, 70B+) |
+| Score, tok/s, Mem%, Ctx, Date | Sort by that column |
+| Quant | Open quantization popup |
+| Mode | Open run-mode popup (GPU, MoE, CPU+GPU, CPU) |
+| Fit | Cycle fit filter |
+| Use Case | Open use-case popup |
+
+Row navigation (`j`/`k`) still works in Select mode so you can see the effect of filters as you apply them. Press `Esc` to return to Normal mode.
 
 ### TUI Plan mode (`p`)
 
