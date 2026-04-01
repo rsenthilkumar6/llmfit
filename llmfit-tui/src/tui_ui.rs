@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Constraint::Length(4), // system info bar (2 rows)
             Constraint::Length(3), // search + filters
             Constraint::Min(10),   // main table
-            Constraint::Length(1), // status bar
+            Constraint::Length(2), // status bar (model name + keybindings)
         ])
         .split(frame.area());
 
@@ -2489,7 +2489,36 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
 fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let (keys, mode_text) = status_keys_and_mode(app);
 
-    // If a download is in progress, show the progress bar
+    // Split into 2 rows: selected model name + keybindings
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
+    // Row 0: selected model full name
+    let model_line = if !app.show_detail && !app.show_compare && !app.show_multi_compare && !app.show_plan {
+        if let Some(&idx) = app.filtered_fits.get(app.selected_row) {
+            let fit = &app.all_fits[idx];
+            Line::from(vec![
+                Span::styled(" ▶ ", Style::default().fg(tc.accent).bold()),
+                Span::styled(
+                    fit.model.name.clone(),
+                    Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}  {}", fit.model.parameter_count, fit.model.provider),
+                    Style::default().fg(tc.muted),
+                ),
+            ])
+        } else {
+            Line::from(Span::styled(" No model selected", Style::default().fg(tc.muted)))
+        }
+    } else {
+        Line::from("")
+    };
+    frame.render_widget(Paragraph::new(model_line), rows[0]);
+
+    // Row 1: keybindings (with download progress if active)
     if let Some(status) = &app.pull_status {
         let progress_text = if let Some(pct) = app.pull_percent {
             format!(" {} [{:.0}%] ", status, pct)
@@ -2503,7 +2532,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 Constraint::Min(20),
                 Constraint::Length(progress_text.len() as u16 + 2),
             ])
-            .split(area);
+            .split(rows[1]);
 
         let status_line = Line::from(vec![
             Span::styled(
@@ -2537,7 +2566,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         Span::styled(keys, Style::default().fg(tc.muted)),
     ]);
 
-    frame.render_widget(Paragraph::new(status_line), area);
+    frame.render_widget(Paragraph::new(status_line), rows[1]);
 }
 
 fn draw_quant_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
