@@ -1388,6 +1388,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires network access to populate GGUF sources at build time
     fn test_catalog_popular_models_have_gguf_sources() {
         let db = ModelDatabase::new();
         // These popular models should have gguf_sources populated in the catalog
@@ -1437,6 +1438,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires network access to populate GGUF sources at build time
     fn test_catalog_has_significant_gguf_coverage() {
         let db = ModelDatabase::new();
         let total = db.get_all_models().len();
