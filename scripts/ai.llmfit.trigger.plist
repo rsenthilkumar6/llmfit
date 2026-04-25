@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.llmfit.trigger</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/rajamans/workspace/dev/repos/personal/llmfit/scripts/llmfit-server-trigger.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/rajamans/workspace/logs/llmfit-trigger.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/rajamans/workspace/logs/llmfit-trigger.log</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/rajamans/workspace/dev/repos/personal/llmfit/scripts</string>
+</dict>
+</plist>
