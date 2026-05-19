@@ -1,5 +1,121 @@
 # Changelog
 
+## [0.9.26](https://github.com/AlexsJones/llmfit/compare/v0.9.25...v0.9.26) (2026-05-19)
+
+
+### Bug Fixes
+
+* **hardware:** detect distinct AMD GPU models in multi-GPU ROCm systems ([#559](https://github.com/AlexsJones/llmfit/issues/559)) ([a100552](https://github.com/AlexsJones/llmfit/commit/a100552a60876ad84ee3b092704a1f4b4dadc143)), closes [#550](https://github.com/AlexsJones/llmfit/issues/550)
+
+## [0.9.25](https://github.com/AlexsJones/llmfit/compare/v0.9.24...v0.9.25) (2026-05-17)
+
+
+### Features
+
+* **scoring:** add generation-aware quality scoring ([#553](https://github.com/AlexsJones/llmfit/issues/553)) ([a3e0eb2](https://github.com/AlexsJones/llmfit/commit/a3e0eb27c57fe05298292f4c61699b9aed2824ea))
+* **tui:** move provider detection to background threads for faster startup ([#554](https://github.com/AlexsJones/llmfit/issues/554)) ([9e8308d](https://github.com/AlexsJones/llmfit/commit/9e8308d3e6dccf83da35694233a53261902ebbf2))
+
+
+### Bug Fixes
+
+* **docker:** skip HTTP probe on Linux when Docker Desktop is not running ([#548](https://github.com/AlexsJones/llmfit/issues/548)) ([ce735c9](https://github.com/AlexsJones/llmfit/commit/ce735c95c39ab10bd936238b7ab611d336a13c12))
+
+## [0.9.24](https://github.com/AlexsJones/llmfit/compare/v0.9.23...v0.9.24) (2026-05-12)
+
+
+### Features
+
+* add MCP server mode and NATS event publishing to llmfit serve ([#545](https://github.com/AlexsJones/llmfit/issues/545)) ([c4958f7](https://github.com/AlexsJones/llmfit/commit/c4958f7edb59225ffd569779fd8442915720bf03))
+
+
+### Bug Fixes
+
+* **hardware:** fix iGPU filtering on Ryzen 9 9950X where 2 GB iGPU passes the &gt;= 2 GB discrete GPU threshold ([#543](https://github.com/AlexsJones/llmfit/issues/543)) ([c655bc1](https://github.com/AlexsJones/llmfit/commit/c655bc1b2e10b5b0a13a123344755e450832a06d))
+* MoE offload speed overestimate for Qwen3-Coder-Next ([#544](https://github.com/AlexsJones/llmfit/issues/544)) ([5bdc9df](https://github.com/AlexsJones/llmfit/commit/5bdc9df9d8e28168fdc4650741be71b715a11fc6))
+
+## [0.9.23](https://github.com/AlexsJones/llmfit/compare/v0.9.22...v0.9.23) (2026-05-10)
+
+
+### Features
+
+* populate architecture metadata for precise KV cache and MoE speed estimation ([#539](https://github.com/AlexsJones/llmfit/issues/539)) ([bab8c01](https://github.com/AlexsJones/llmfit/commit/bab8c012771acec3bbd4a051fd3720379bb01e5d))
+
+
+### Bug Fixes
+
+* **bench:** implement 5 follow-up improvements to PR [#278](https://github.com/AlexsJones/llmfit/issues/278) ([#523](https://github.com/AlexsJones/llmfit/issues/523)) ([91fee77](https://github.com/AlexsJones/llmfit/commit/91fee7702a5728fd1b0b64459c8be024fc82051a))
+
+## [0.9.22](https://github.com/AlexsJones/llmfit/compare/v0.9.21...v0.9.22) (2026-05-06)
+
+
+### Features
+
+* overhaul model discovery with cursor pagination, trending, and additive DB ([#537](https://github.com/AlexsJones/llmfit/issues/537)) ([93e9d67](https://github.com/AlexsJones/llmfit/commit/93e9d673cf54bde62dc7b24a1400c1cd89f70c1c))
+
+## [0.9.21](https://github.com/AlexsJones/llmfit/compare/v0.9.20...v0.9.21) (2026-05-05)
+
+
+### Bug Fixes
+
+* add AutoRound format detection to prevent misclassification as GGUF ([#532](https://github.com/AlexsJones/llmfit/issues/532)) ([8214b1f](https://github.com/AlexsJones/llmfit/commit/8214b1f19bad2ed8e5b9e9ae98d203447c09fd36))
+
+## [0.9.20](https://github.com/AlexsJones/llmfit/compare/v0.9.19...v0.9.20) (2026-05-04)
+
+
+### Bug Fixes
+
+* **lmstudio:** resolve HF repo IDs to direct GGUF file URLs for download ([#530](https://github.com/AlexsJones/llmfit/issues/530)) ([115a01d](https://github.com/AlexsJones/llmfit/commit/115a01d66e1a1689715dc1266d98a5887cc3d687))
+
+## [0.9.19](https://github.com/AlexsJones/llmfit/compare/v0.9.18...v0.9.19) (2026-05-03)
+
+
+### Features
+
+* add llmfit bench for live inference benchmarking with quality metrics ([#278](https://github.com/AlexsJones/llmfit/issues/278)) ([8896fdb](https://github.com/AlexsJones/llmfit/commit/8896fdb861fa6950081c144ddf23d9eb24aef7ed))
+
+
+### Bug Fixes
+
+* **lmstudio:** wrap HuggingFace repo IDs in canonical URL for download ([#520](https://github.com/AlexsJones/llmfit/issues/520)) ([3399c70](https://github.com/AlexsJones/llmfit/commit/3399c70b6b2237c2285d92efe3ac1ebb2178b80e)), closes [#519](https://github.com/AlexsJones/llmfit/issues/519)
+* **ollama:** treat OLLAMA_HOST=0.0.0.0 as a bind address and fall back to localhost ([#521](https://github.com/AlexsJones/llmfit/issues/521)) ([3a7bcf5](https://github.com/AlexsJones/llmfit/commit/3a7bcf52628161f142c9eed6151c9408f5af8ef4)), closes [#516](https://github.com/AlexsJones/llmfit/issues/516)
+
+## [0.9.18](https://github.com/AlexsJones/llmfit/compare/v0.9.17...v0.9.18) (2026-04-30)
+
+
+### Features
+
+* **recommend:** add --output-llamacpp flag  ([#508](https://github.com/AlexsJones/llmfit/issues/508)) ([7c5925c](https://github.com/AlexsJones/llmfit/commit/7c5925c949878fe1015d815a1245734c75db1aca))
+
+
+### Bug Fixes
+
+* filter CPU Vulkan devices and suppress ROCm+Vulkan duplicates (fixes [#271](https://github.com/AlexsJones/llmfit/issues/271)) ([#328](https://github.com/AlexsJones/llmfit/issues/328)) ([fe8d3f0](https://github.com/AlexsJones/llmfit/commit/fe8d3f050a69b04589bf872e41001187fdd469ca))
+
+## [0.9.17](https://github.com/AlexsJones/llmfit/compare/v0.9.16...v0.9.17) (2026-04-29)
+
+
+### Features
+
+* add benchmark cache with offline fallback ([928390b](https://github.com/AlexsJones/llmfit/commit/928390b467a78e9bf7b1f73f819acdea8044184b))
+* add RWKV v7 G1f models (1.5B, 2.9B, 7.2B, 13.3B) ([#517](https://github.com/AlexsJones/llmfit/issues/517)) ([fab2bec](https://github.com/AlexsJones/llmfit/commit/fab2bec907db77ca63866a6c980bf8418d804b88)), closes [#515](https://github.com/AlexsJones/llmfit/issues/515)
+
+## [0.9.16](https://github.com/AlexsJones/llmfit/compare/v0.9.15...v0.9.16) (2026-04-27)
+
+
+### Features
+
+* add community benchmarks view from localmaxxing.com ([4d0ffa7](https://github.com/AlexsJones/llmfit/commit/4d0ffa79d8f332b51d5fbc990815612bf03b5069))
+* add hardware picker to benchmarks view (H key) ([21661b2](https://github.com/AlexsJones/llmfit/commit/21661b21fb28261502f915b62eb9691a5f837dcf))
+* add vLLM inference provider ([bfb0bb2](https://github.com/AlexsJones/llmfit/commit/bfb0bb202b97bc0fc97973b3688e54e83397a195)), closes [#501](https://github.com/AlexsJones/llmfit/issues/501)
+* **download:** add --output-dir flag to override cache path ([#499](https://github.com/AlexsJones/llmfit/issues/499)) ([f70409f](https://github.com/AlexsJones/llmfit/commit/f70409fc1c904100bc941c89aeea62b4fa8594b2))
+
+
+### Bug Fixes
+
+* add debug warning when util &gt; 1.0 in GPU-mode VRAM pressure calculation ([#513](https://github.com/AlexsJones/llmfit/issues/513)) ([92d0f63](https://github.com/AlexsJones/llmfit/commit/92d0f63c54669f4381be32c75c2b86532b1b0618)), closes [#496](https://github.com/AlexsJones/llmfit/issues/496)
+* deduplicate AMD GPUs detected by both ROCm and Vulkan (fixes [#139](https://github.com/AlexsJones/llmfit/issues/139)) ([#314](https://github.com/AlexsJones/llmfit/issues/314)) ([43dd9fc](https://github.com/AlexsJones/llmfit/commit/43dd9fc075ec20fca1fcd1598c9bf98df32ad9de))
+* match leaderboard API nested response schema ([4282eb4](https://github.com/AlexsJones/llmfit/commit/4282eb46331c8d14454baafe1af1760f28e80f48))
+
 ## [0.9.15](https://github.com/AlexsJones/llmfit/compare/v0.9.14...v0.9.15) (2026-04-25)
 
 

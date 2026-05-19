@@ -1,7 +1,6 @@
-//! Runtime model providers (Ollama, llama.cpp, MLX, Docker Model Runner, LM Studio).
+//! Runtime model providers (Ollama, llama.cpp, MLX, Docker Model Runner, LM Studio, vLLM).
 //!
 //! Each provider can list locally installed models and pull new ones.
-//! The trait is designed to be extended for vLLM, etc.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -74,17 +73,51 @@ fn normalize_ollama_host(raw: &str) -> Option<String> {
     Some(format!("http://{host}"))
 }
 
+/// Returns true if the URL's host is a wildcard bind address — `0.0.0.0`
+/// (IPv4) or `[::]` (IPv6). Servers listen on these to accept traffic on
+/// every interface, but they are never valid as a connect target. When
+/// Ollama is started with `OLLAMA_HOST=0.0.0.0`, that value leaks into the
+/// environment and we must not pass it to a client.
+fn is_wildcard_bind_address(url: &str) -> bool {
+    let after_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let host_port = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+
+    if let Some(rest) = host_port.strip_prefix('[') {
+        if let Some(end_idx) = rest.find(']') {
+            let host = &rest[..end_idx];
+            return host == "::" || host == "0:0:0:0:0:0:0:0";
+        }
+        return false;
+    }
+
+    let host = host_port.split(':').next().unwrap_or("");
+    host == "0.0.0.0"
+}
+
 impl Default for OllamaProvider {
     fn default() -> Self {
         let explicit = std::env::var("OLLAMA_HOST").ok().and_then(|raw| {
-            let normalized = normalize_ollama_host(&raw);
-            if normalized.is_none() {
+            let Some(normalized) = normalize_ollama_host(&raw) else {
                 eprintln!(
                     "Warning: could not parse OLLAMA_HOST='{}'. Expected host:port or http(s)://host:port",
                     raw
                 );
+                return None;
+            };
+            if is_wildcard_bind_address(&normalized) {
+                eprintln!(
+                    "Warning: OLLAMA_HOST='{}' is a wildcard bind address; falling back to localhost.",
+                    raw
+                );
+                return None;
             }
-            normalized
+            Some(normalized)
         });
 
         if let Some(base_url) = explicit {
@@ -1382,6 +1415,28 @@ pub struct DockerModelRunnerProvider {
     base_url: String,
 }
 
+/// Check if Docker Desktop is running on Linux by looking for its socket or process.
+/// Returns `true` if Docker Desktop appears to be active, `false` otherwise.
+/// This avoids a slow HTTP timeout on Linux systems without Docker Desktop.
+fn is_docker_desktop_running() -> bool {
+    // Docker Desktop on Linux creates a specific socket path
+    if std::path::Path::new("/run/docker-desktop/docker.sock").exists()
+        || std::path::Path::new(
+            &std::env::var("HOME")
+                .map(|h| format!("{h}/.docker/desktop/docker.sock"))
+                .unwrap_or_default(),
+        )
+        .exists()
+    {
+        return true;
+    }
+    // Fall back to checking if the DOCKER_MODEL_RUNNER_HOST env var is explicitly set
+    // to a non-empty value (an empty string means the user hasn't configured it).
+    std::env::var("DOCKER_MODEL_RUNNER_HOST")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
 fn normalize_docker_mr_host(raw: &str) -> Option<String> {
     let host = raw.trim();
     if host.is_empty() {
@@ -1431,6 +1486,13 @@ impl DockerModelRunnerProvider {
     /// Single-pass startup probe.
     /// Returns `(available, installed_models, count)`.
     pub fn detect_with_installed(&self) -> (bool, HashSet<String>, usize) {
+        // Docker Model Runner is a Docker Desktop feature. On Linux, Docker Desktop
+        // is uncommon. Skip the HTTP probe if Docker Desktop is not running to avoid
+        // a ~800ms timeout on every startup.
+        if cfg!(target_os = "linux") && !is_docker_desktop_running() {
+            return (false, HashSet::new(), 0);
+        }
+
         let mut set = HashSet::new();
         let Ok(resp) = ureq::get(&self.models_url())
             .config()
@@ -1700,7 +1762,19 @@ impl ModelProvider for LmStudioProvider {
 
     fn start_pull(&self, model_tag: &str) -> Result<PullHandle, String> {
         let download_url = self.download_url();
-        let tag = model_tag.to_string();
+        let models_url = self.models_url();
+        let tag = match lmstudio_pull_tag(model_tag) {
+            Some(t) => t,
+            None => {
+                return Err(format!(
+                    "Could not find a GGUF file for '{model_tag}'. \
+                     LM Studio requires a direct link to a .gguf file. \
+                     Try providing a HuggingFace repo that contains GGUF weights \
+                     (e.g. bartowski/ or ggml-org/ variants)."
+                ));
+            }
+        };
+        let model_tag_owned = model_tag.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
 
         let body = serde_json::json!({
@@ -1708,8 +1782,11 @@ impl ModelProvider for LmStudioProvider {
         });
 
         std::thread::spawn(move || {
-            // LM Studio streams download progress as newline-delimited JSON
-            // from the POST response itself — there is no separate status endpoint.
+            // LM Studio may stream download progress as newline-delimited JSON
+            // from the POST response, or it may acknowledge the request and
+            // close the stream while the download proceeds in the background.
+            // In the latter case we poll the installed models list to detect
+            // eventual completion.
             let resp = ureq::post(&download_url)
                 .config()
                 .timeout_global(Some(std::time::Duration::from_secs(3600)))
@@ -1758,6 +1835,7 @@ impl ModelProvider for LmStudioProvider {
                                     ));
                                     return;
                                 }
+
                                 let _ = tx.send(PullEvent::Progress {
                                     status: format!(
                                         "Downloading via LM Studio ({})",
@@ -1788,7 +1866,7 @@ impl ModelProvider for LmStudioProvider {
                             });
                             let _ = tx.send(PullEvent::Done);
                             saw_completion = true;
-                            return;
+                            break;
                         }
 
                         if st.status == "failed" {
@@ -1804,9 +1882,65 @@ impl ModelProvider for LmStudioProvider {
                     }
 
                     if !saw_completion {
-                        let _ = tx.send(PullEvent::Error(
-                            "LM Studio download stream ended without completion".to_string(),
-                        ));
+                        // Stream ended without a completion event. The POST
+                        // succeeded so LM Studio accepted the request — it
+                        // is likely downloading in the background. Poll the
+                        // installed models list to detect completion.
+                        let candidates = hf_name_to_lmstudio_candidates(&model_tag_owned);
+                        let poll_interval = std::time::Duration::from_secs(3);
+                        let max_polls = 600; // 30 minutes max
+
+                        let _ = tx.send(PullEvent::Progress {
+                            status: "Downloading via LM Studio (tracking)...".to_string(),
+                            percent: None,
+                        });
+
+                        for poll_num in 0..max_polls {
+                            std::thread::sleep(poll_interval);
+
+                            let Ok(resp) = ureq::get(&models_url)
+                                .config()
+                                .timeout_global(Some(std::time::Duration::from_secs(5)))
+                                .build()
+                                .call()
+                            else {
+                                continue;
+                            };
+
+                            let Ok(list) = resp.into_body().read_json::<LmStudioModelList>() else {
+                                continue;
+                            };
+
+                            let installed: HashSet<String> =
+                                list.data.into_iter().map(|m| m.id.to_lowercase()).collect();
+
+                            for candidate in &candidates {
+                                if installed.contains(candidate.as_str()) {
+                                    let _ = tx.send(PullEvent::Progress {
+                                        status: "Download complete".to_string(),
+                                        percent: Some(100.0),
+                                    });
+                                    let _ = tx.send(PullEvent::Done);
+                                    return;
+                                }
+                            }
+
+                            // Send periodic progress so the UI knows we're
+                            // still tracking the background download.
+                            if poll_num % 10 == 9 {
+                                let elapsed_secs = (poll_num + 1) as u64 * poll_interval.as_secs();
+                                let _ = tx.send(PullEvent::Progress {
+                                    status: format!(
+                                        "Downloading via LM Studio ({}s elapsed)...",
+                                        elapsed_secs
+                                    ),
+                                    percent: None,
+                                });
+                            }
+                        }
+
+                        let _ =
+                            tx.send(PullEvent::Error("LM Studio download timed out".to_string()));
                     }
                 }
                 Err(e) => {
@@ -1860,21 +1994,302 @@ pub fn is_model_installed_lmstudio(hf_name: &str, installed: &HashSet<String>) -
     })
 }
 
-/// LM Studio can download any HuggingFace model, so we always return true
-/// if the model has GGUF sources (which have HF repo IDs).
+/// Returns `true` when we can reasonably expect LM Studio to download this
+/// model. LM Studio requires a direct `.gguf` file link, so we check for
+/// known GGUF repos or heuristic candidates. Catalog short names (no slash)
+/// and full URLs are always accepted.
 pub fn has_lmstudio_mapping(hf_name: &str) -> bool {
-    // LM Studio can download from HF directly, so any model with a known
-    // GGUF source or a HF name is potentially downloadable.
-    !hf_name.is_empty()
+    if hf_name.is_empty() {
+        return false;
+    }
+    // Full URLs and catalog short names are always accepted
+    if hf_name.starts_with("http://") || hf_name.starts_with("https://") || !hf_name.contains('/') {
+        return true;
+    }
+    // Check for known GGUF repo mapping (local, no network)
+    if lookup_gguf_repo(hf_name).is_some() {
+        return true;
+    }
+    // Heuristic: check if any candidate GGUF repo exists (may probe network)
+    first_existing_gguf_repo(hf_name).is_some()
+}
+
+/// Build a HuggingFace resolve URL for a specific GGUF file.
+fn lmstudio_gguf_resolve_url(repo_id: &str, filename: &str) -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        repo_id, filename
+    )
+}
+
+/// Try to find a direct GGUF file URL for an HF model name.
+///
+/// LM Studio's download endpoint rejects base model repos (which contain
+/// safetensors/pytorch weights) and requires a direct link to a `.gguf` file.
+/// This function looks up known GGUF repos, lists their files, selects the
+/// best quantization that fits in system RAM, and returns a resolve URL.
+///
+/// Returns `None` if no GGUF files are found or the network is unavailable.
+fn lmstudio_find_gguf_url(hf_name: &str) -> Option<String> {
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_memory();
+    let system_ram_gb = sys.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
+    // Leave headroom for OS and overhead
+    let budget_gb = system_ram_gb * 0.85;
+
+    // Try known mappings first
+    if let Some(repo) = lookup_gguf_repo(hf_name) {
+        if let Some(url) = try_gguf_repo(repo, budget_gb) {
+            return Some(url);
+        }
+    }
+
+    // Try heuristic candidates (bartowski/, ggml-org/, TheBloke/)
+    for candidate in hf_name_to_gguf_candidates(hf_name) {
+        if let Some(url) = try_gguf_repo(&candidate, budget_gb) {
+            return Some(url);
+        }
+    }
+
+    // Try the base repo itself (some repos host GGUF directly)
+    if hf_name.contains('/') {
+        if let Some(url) = try_gguf_repo(hf_name, budget_gb) {
+            return Some(url);
+        }
+    }
+
+    None
+}
+
+/// Try to find a GGUF file in a specific repo.
+fn try_gguf_repo(repo_id: &str, budget_gb: f64) -> Option<String> {
+    let files = LlamaCppProvider::list_repo_gguf_files(repo_id);
+    if files.is_empty() {
+        return None;
+    }
+    let (filename, _) = LlamaCppProvider::select_best_gguf(&files, budget_gb)?;
+    Some(lmstudio_gguf_resolve_url(repo_id, &filename))
 }
 
 /// Given an HF model name, return the model identifier to use for LM Studio download.
-/// LM Studio accepts HF model names directly.
+///
+/// LM Studio's `/api/v1/models/download` requires a direct link to a `.gguf`
+/// file. For HF repo IDs, we first attempt to resolve a GGUF file URL by
+/// looking up known GGUF repos and selecting the best quantization. If that
+/// fails (network unavailable or no GGUF found), we fall back to wrapping
+/// the repo in a base HF URL for backward compatibility.
+///
+/// Full HTTP(S) URLs are passed through unchanged. Bare short names (no slash)
+/// are assumed to be LM Studio first-party catalog entries.
 pub fn lmstudio_pull_tag(hf_name: &str) -> Option<String> {
     if hf_name.is_empty() {
         return None;
     }
-    // Use the full HF name as the download identifier
+
+    // Pass through existing URLs and catalog short names
+    if hf_name.starts_with("https://") || hf_name.starts_with("http://") || !hf_name.contains('/') {
+        return Some(hf_name.to_string());
+    }
+
+    // Try to find a direct GGUF file URL
+    if let Some(url) = lmstudio_find_gguf_url(hf_name) {
+        return Some(url);
+    }
+
+    // No GGUF file found — return None so the caller can produce a
+    // helpful error instead of sending a bare repo URL that LM Studio
+    // will reject with HTTP 404.
+    None
+}
+
+// ---------------------------------------------------------------------------
+// vLLM provider
+// ---------------------------------------------------------------------------
+
+/// vLLM — high-throughput inference server with an OpenAI-compatible API.
+///
+/// Exposes `GET /v1/models` to list loaded models at
+/// `http://localhost:8000` by default. Override with `VLLM_HOST`.
+///
+/// vLLM does not have a pull/download endpoint — models are loaded at
+/// server start via HuggingFace. The `start_pull` implementation
+/// returns an informational error directing users to restart vLLM with
+/// the desired model.
+pub struct VllmProvider {
+    base_url: String,
+}
+
+fn normalize_vllm_host(raw: &str) -> Option<String> {
+    let host = raw.trim();
+    if host.is_empty() {
+        return None;
+    }
+
+    if host.starts_with("http://") || host.starts_with("https://") {
+        return Some(host.to_string());
+    }
+
+    if host.contains("://") {
+        return None;
+    }
+
+    Some(format!("http://{host}"))
+}
+
+impl Default for VllmProvider {
+    fn default() -> Self {
+        let base_url = std::env::var("VLLM_HOST")
+            .ok()
+            .and_then(|raw| {
+                let normalized = normalize_vllm_host(&raw);
+                if normalized.is_none() {
+                    eprintln!(
+                        "Warning: could not parse VLLM_HOST='{}'. \
+                         Expected host:port or http(s)://host:port",
+                        raw
+                    );
+                }
+                normalized
+            })
+            .unwrap_or_else(|| "http://localhost:8000".to_string());
+        Self { base_url }
+    }
+}
+
+impl VllmProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn models_url(&self) -> String {
+        format!("{}/v1/models", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Single-pass startup probe.
+    /// Returns `(available, installed_models, count)`.
+    pub fn detect_with_installed(&self) -> (bool, HashSet<String>, usize) {
+        let mut set = HashSet::new();
+        let Ok(resp) = ureq::get(&self.models_url())
+            .config()
+            .timeout_global(Some(std::time::Duration::from_millis(800)))
+            .build()
+            .call()
+        else {
+            return (false, set, 0);
+        };
+
+        let Ok(list) = resp.into_body().read_json::<VllmModelList>() else {
+            return (true, set, 0);
+        };
+        let models = list.data;
+        let count = models.len();
+        for m in models {
+            let lower = m.id.to_lowercase();
+            set.insert(lower.clone());
+            // Also insert the model part after the publisher
+            // e.g. "meta-llama/Llama-3.1-8B-Instruct" → "llama-3.1-8b-instruct"
+            if let Some(name) = lower.split('/').next_back()
+                && name != lower
+            {
+                set.insert(name.to_string());
+            }
+        }
+        (true, set, count)
+    }
+
+    pub fn installed_models_counted(&self) -> (HashSet<String>, usize) {
+        let (_, set, count) = self.detect_with_installed();
+        (set, count)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct VllmModelList {
+    data: Vec<VllmModel>,
+}
+
+#[derive(serde::Deserialize)]
+struct VllmModel {
+    /// Model id, e.g. "meta-llama/Llama-3.1-8B-Instruct"
+    id: String,
+}
+
+impl ModelProvider for VllmProvider {
+    fn name(&self) -> &str {
+        "vLLM"
+    }
+
+    fn is_available(&self) -> bool {
+        ureq::get(&self.models_url())
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(2)))
+            .build()
+            .call()
+            .is_ok()
+    }
+
+    fn installed_models(&self) -> HashSet<String> {
+        let (set, _) = self.installed_models_counted();
+        set
+    }
+
+    fn start_pull(&self, _model_tag: &str) -> Result<PullHandle, String> {
+        Err("vLLM does not support downloading models at runtime. \
+             Restart the vLLM server with the desired model \
+             (e.g. `vllm serve <model>`)."
+            .to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// vLLM name-matching helpers
+// ---------------------------------------------------------------------------
+
+/// vLLM uses HuggingFace model names directly. We match against the
+/// model's full HF name and common naming patterns.
+pub fn hf_name_to_vllm_candidates(hf_name: &str) -> Vec<String> {
+    let repo = hf_name
+        .split('/')
+        .next_back()
+        .unwrap_or(hf_name)
+        .to_lowercase();
+    let mut candidates = vec![hf_name.to_lowercase()];
+    if repo != hf_name.to_lowercase() {
+        candidates.push(repo.clone());
+    }
+    // Strip common suffixes for matching
+    let stripped = repo
+        .replace("-instruct", "")
+        .replace("-chat", "")
+        .replace("-hf", "")
+        .replace("-it", "");
+    if stripped != repo {
+        candidates.push(stripped);
+    }
+    candidates
+}
+
+/// Check if any vLLM candidates for an HF model appear in the installed set.
+pub fn is_model_installed_vllm(hf_name: &str, installed: &HashSet<String>) -> bool {
+    let candidates = hf_name_to_vllm_candidates(hf_name);
+    candidates.iter().any(|candidate| {
+        installed
+            .iter()
+            .any(|installed_name| installed_name.contains(candidate))
+    })
+}
+
+/// vLLM can serve any HuggingFace model, so we always return true.
+pub fn has_vllm_mapping(hf_name: &str) -> bool {
+    !hf_name.is_empty()
+}
+
+/// Given an HF model name, return the model identifier to use for vLLM.
+/// vLLM accepts HF model names directly.
+pub fn vllm_pull_tag(hf_name: &str) -> Option<String> {
+    if hf_name.is_empty() {
+        return None;
+    }
     Some(hf_name.to_string())
 }
 
@@ -2831,6 +3246,103 @@ mod tests {
     }
 
     #[test]
+    fn test_lmstudio_pull_tag_resolves_gguf_url() {
+        // HF repo IDs should resolve to a direct GGUF file URL via known
+        // mappings or heuristic repo lookups. The exact URL depends on
+        // available files and system RAM, so we only assert the shape.
+        // Returns None when no GGUF file can be found (no fallback to bare repo URL).
+        if let Some(tag) = lmstudio_pull_tag("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct") {
+            assert!(
+                tag.starts_with("https://huggingface.co/")
+                    && tag.contains("/resolve/main/")
+                    && tag.ends_with(".gguf")
+            );
+        }
+    }
+
+    #[test]
+    fn test_lmstudio_pull_tag_no_gguf_returns_none() {
+        // A repo with no GGUF files should return None, not a bare HF URL
+        // that LM Studio would reject with 404.
+        let result = lmstudio_pull_tag("some-org/safetensors-only-model");
+        assert!(
+            result.is_none(),
+            "expected None for repo without GGUF files, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lmstudio_pull_tag_passes_through_full_url() {
+        let url = "https://huggingface.co/lmstudio-community/deepseek-coder-v2-lite-instruct-gguf";
+        assert_eq!(lmstudio_pull_tag(url).unwrap(), url);
+
+        let http = "http://example.com/some/model";
+        assert_eq!(lmstudio_pull_tag(http).unwrap(), http);
+    }
+
+    #[test]
+    fn test_lmstudio_pull_tag_leaves_catalog_short_name_unchanged() {
+        // No slash → assumed to be an LM Studio first-party catalog entry.
+        assert_eq!(lmstudio_pull_tag("llama-3.1-8b").unwrap(), "llama-3.1-8b");
+    }
+
+    #[test]
+    fn test_lmstudio_pull_tag_empty_returns_none() {
+        assert!(lmstudio_pull_tag("").is_none());
+    }
+
+    #[test]
+    fn test_lmstudio_pull_tag_is_idempotent() {
+        // A resolved URL must be safe to apply twice — start_pull and the TUI
+        // both route through the same resolver.
+        if let Some(once) = lmstudio_pull_tag("Qwen/Qwen2.5-7B-Instruct") {
+            let twice = lmstudio_pull_tag(&once).unwrap();
+            assert_eq!(once, twice);
+        }
+        // Catalog short names are always idempotent
+        let once = lmstudio_pull_tag("llama-3.1-8b").unwrap();
+        let twice = lmstudio_pull_tag(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn test_lmstudio_gguf_resolve_url_format() {
+        let url = lmstudio_gguf_resolve_url(
+            "lmstudio-community/DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+            "DeepSeek-Coder-V2-Lite-Instruct-Q6_K.gguf",
+        );
+        assert_eq!(
+            url,
+            "https://huggingface.co/lmstudio-community/DeepSeek-Coder-V2-Lite-Instruct-GGUF/resolve/main/DeepSeek-Coder-V2-Lite-Instruct-Q6_K.gguf"
+        );
+    }
+
+    #[test]
+    fn test_hf_name_to_lmstudio_candidates_full_repo() {
+        let candidates = hf_name_to_lmstudio_candidates("lmstudio-community/Qwen3-1.7B-GGUF");
+        assert!(candidates.contains(&"lmstudio-community/qwen3-1.7b-gguf".to_string()));
+        assert!(candidates.contains(&"qwen3-1.7b-gguf".to_string()));
+    }
+
+    #[test]
+    fn test_hf_name_to_lmstudio_candidates_strips_suffixes() {
+        let candidates = hf_name_to_lmstudio_candidates("meta-llama/Llama-3-8B-Instruct");
+        assert!(candidates.contains(&"meta-llama/llama-3-8b-instruct".to_string()));
+        assert!(candidates.contains(&"llama-3-8b-instruct".to_string()));
+        // Stripped variant (without -instruct)
+        assert!(candidates.contains(&"llama-3-8b".to_string()));
+    }
+
+    #[test]
+    fn test_hf_name_to_lmstudio_candidates_bare_name() {
+        let candidates = hf_name_to_lmstudio_candidates("qwen3");
+        assert!(candidates.contains(&"qwen3".to_string()));
+        // No slash, so repo == full name — no duplicate
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
     fn test_is_model_installed_mlx_with_owner_prefixed_repo_id() {
         let mut installed = HashSet::new();
         installed.insert("lmstudio-community/qwen3-coder-30b-a3b-instruct-mlx-8bit".to_string());
@@ -2933,6 +3445,37 @@ mod tests {
             normalize_ollama_host("ftp://ollama.example.com:11434"),
             None
         );
+    }
+
+    #[test]
+    fn test_is_wildcard_bind_address_ipv4() {
+        assert!(is_wildcard_bind_address("0.0.0.0"));
+        assert!(is_wildcard_bind_address("0.0.0.0:11434"));
+        assert!(is_wildcard_bind_address("http://0.0.0.0"));
+        assert!(is_wildcard_bind_address("http://0.0.0.0:11434"));
+        assert!(is_wildcard_bind_address("https://0.0.0.0:11434"));
+        assert!(is_wildcard_bind_address("http://0.0.0.0:11434/api/tags"));
+    }
+
+    #[test]
+    fn test_is_wildcard_bind_address_ipv6() {
+        assert!(is_wildcard_bind_address("[::]"));
+        assert!(is_wildcard_bind_address("[::]:11434"));
+        assert!(is_wildcard_bind_address("http://[::]:11434"));
+        assert!(is_wildcard_bind_address("http://[0:0:0:0:0:0:0:0]:11434"));
+    }
+
+    #[test]
+    fn test_is_wildcard_bind_address_rejects_routable_hosts() {
+        assert!(!is_wildcard_bind_address("localhost"));
+        assert!(!is_wildcard_bind_address("http://localhost:11434"));
+        assert!(!is_wildcard_bind_address("127.0.0.1"));
+        assert!(!is_wildcard_bind_address("http://127.0.0.1:11434"));
+        assert!(!is_wildcard_bind_address("http://[::1]:11434"));
+        assert!(!is_wildcard_bind_address("http://ollama.example.com:11434"));
+        // Hostnames or IPs that merely contain "0.0.0.0" as a substring must not match.
+        assert!(!is_wildcard_bind_address("http://10.0.0.0.example.com"));
+        assert!(!is_wildcard_bind_address("http://10.0.0.1:11434"));
     }
 
     #[test]
@@ -3714,5 +4257,102 @@ mod tests {
             normalize_docker_mr_host("ftp://docker.example.com:12434"),
             None
         );
+    }
+
+    // ── vLLM ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hf_name_to_vllm_candidates() {
+        let candidates = hf_name_to_vllm_candidates("meta-llama/Llama-3.1-8B-Instruct");
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c == "meta-llama/llama-3.1-8b-instruct")
+        );
+        assert!(candidates.iter().any(|c| c == "llama-3.1-8b-instruct"));
+        // stripped variant (without -instruct)
+        assert!(candidates.iter().any(|c| c == "llama-3.1-8b"));
+    }
+
+    #[test]
+    fn test_is_model_installed_vllm() {
+        let mut installed = HashSet::new();
+        installed.insert("meta-llama/llama-3.1-8b-instruct".to_string());
+        assert!(is_model_installed_vllm(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            &installed
+        ));
+        assert!(!is_model_installed_vllm(
+            "meta-llama/Llama-3.1-70B-Instruct",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_has_vllm_mapping() {
+        assert!(has_vllm_mapping("meta-llama/Llama-3.1-8B-Instruct"));
+        assert!(!has_vllm_mapping(""));
+    }
+
+    #[test]
+    fn test_vllm_pull_tag() {
+        assert_eq!(
+            vllm_pull_tag("meta-llama/Llama-3.1-8B-Instruct"),
+            Some("meta-llama/Llama-3.1-8B-Instruct".to_string())
+        );
+        assert_eq!(vllm_pull_tag(""), None);
+    }
+
+    #[test]
+    fn test_normalize_vllm_host_with_scheme() {
+        assert_eq!(
+            normalize_vllm_host("http://myhost:8000"),
+            Some("http://myhost:8000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_vllm_host_without_scheme() {
+        assert_eq!(
+            normalize_vllm_host("myhost:8000"),
+            Some("http://myhost:8000".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_vllm_host_rejects_unsupported_scheme() {
+        assert_eq!(normalize_vllm_host("ftp://myhost:8000"), None);
+    }
+
+    #[test]
+    fn test_normalize_vllm_host_empty() {
+        assert_eq!(normalize_vllm_host(""), None);
+        assert_eq!(normalize_vllm_host("  "), None);
+    }
+
+    #[test]
+    fn test_docker_desktop_running_via_env_var() {
+        // Test 1: Non-empty value should detect Docker Desktop
+        unsafe {
+            std::env::set_var("DOCKER_MODEL_RUNNER_HOST", "localhost:12434");
+        }
+        assert!(is_docker_desktop_running());
+
+        // Test 2: Empty string should NOT count as running
+        unsafe {
+            std::env::set_var("DOCKER_MODEL_RUNNER_HOST", "");
+        }
+        assert!(!is_docker_desktop_running());
+
+        // Test 3: Whitespace-only should NOT count as running
+        unsafe {
+            std::env::set_var("DOCKER_MODEL_RUNNER_HOST", "   ");
+        }
+        assert!(!is_docker_desktop_running());
+
+        // Cleanup
+        unsafe {
+            std::env::remove_var("DOCKER_MODEL_RUNNER_HOST");
+        }
     }
 }

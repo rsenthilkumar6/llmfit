@@ -1,5 +1,8 @@
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 use colored::*;
-use llmfit_core::fit::{FitLevel, ModelFit, SortColumn};
+use llmfit_core::fit::{FitLevel, ModelFit, RunMode, SortColumn};
 use llmfit_core::hardware::SystemSpecs;
 use llmfit_core::models::LlmModel;
 use llmfit_core::plan::PlanEstimate;
@@ -498,6 +501,158 @@ pub fn display_json_fits(specs: &SystemSpecs, fits: &[ModelFit]) {
     );
 }
 
+/// Serialize system specs + model fits to JSON with llama.cpp commands and print to stdout.
+pub fn display_json_fits_with_llamacpp(specs: &SystemSpecs, fits: &[ModelFit]) {
+    use llmfit_core::fit::InferenceRuntime;
+
+    let models: Vec<serde_json::Value> = fits
+        .iter()
+        .map(|fit| {
+            let mut json = fit_to_json(fit);
+
+            // Add suggested llama.cpp command for llama.cpp-compatible models
+            if fit.runtime == InferenceRuntime::LlamaCpp
+                && let Some(cmd) = generate_llamacpp_command(fit)
+            {
+                json.as_object_mut().unwrap().insert(
+                    "llamacpp_command".to_string(),
+                    serde_json::Value::String(cmd),
+                );
+            }
+
+            json
+        })
+        .collect();
+
+    let output = serde_json::json!({
+        "system": system_json(specs),
+        "models": models,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("JSON serialization failed")
+    );
+}
+
+/// Generate a llama.cpp command string for a model fit.
+fn generate_llamacpp_command(fit: &ModelFit) -> Option<String> {
+    if fit.run_mode == RunMode::TensorParallel {
+        return None;
+    }
+
+    // Get the GGUF source repo if available
+    let repo = fit.model.gguf_sources.first().map(|s| &s.repo);
+
+    let quant = &fit.best_quant;
+    let context = fit.effective_context_length;
+    let ngl_args = llamacpp_ngl_args(fit.run_mode)?;
+    let conversation_arg = if should_use_llamacpp_conversation_mode(fit) {
+        " -cnv"
+    } else {
+        ""
+    };
+
+    // Use the -hf option with HuggingFace repo to let llama-cli handle model
+    // downloading/caching. This avoids path guessing issues and works for both
+    // installed and non-installed models. llama-cli automatically downloads
+    // to its own cache if the model isn't present locally.
+    repo.map(|repo| {
+        format!(
+            "llama-cli -hf {}:{} {} -c {}{}",
+            repo, quant, ngl_args, context, conversation_arg
+        )
+    })
+}
+
+fn llamacpp_ngl_args(run_mode: RunMode) -> Option<&'static str> {
+    match run_mode {
+        RunMode::CpuOffload | RunMode::MoeOffload => {
+            llamacpp_ngl_args_for_support(run_mode, llamacpp_supports_fit_arg())
+        }
+        _ => llamacpp_ngl_args_for_support(run_mode, false),
+    }
+}
+
+fn llamacpp_ngl_args_for_support(
+    run_mode: RunMode,
+    supports_fit_arg: bool,
+) -> Option<&'static str> {
+    match run_mode {
+        RunMode::Gpu => Some("-ngl all"),
+        RunMode::CpuOnly => Some("-ngl 0"),
+        RunMode::CpuOffload => Some(if supports_fit_arg {
+            "-ngl auto --fit on"
+        } else {
+            "-ngl auto"
+        }),
+        // llmfit's MoE estimate is not an exact llama.cpp layer/MoE split, so
+        // prefer llama.cpp's fit-aware auto offload rather than forcing --cpu-moe.
+        RunMode::MoeOffload => Some(if supports_fit_arg {
+            "-ngl auto --fit on"
+        } else {
+            "-ngl auto"
+        }),
+        RunMode::TensorParallel => None,
+    }
+}
+
+fn llamacpp_supports_fit_arg() -> bool {
+    static SUPPORTS_FIT_ARG: OnceLock<bool> = OnceLock::new();
+
+    *SUPPORTS_FIT_ARG.get_or_init(|| {
+        let candidate = llamacpp_binary_arg();
+        let Ok(output) = std::process::Command::new(&candidate)
+            .arg("--help")
+            .output()
+        else {
+            return false;
+        };
+
+        String::from_utf8_lossy(&output.stdout).contains("--fit")
+            || String::from_utf8_lossy(&output.stderr).contains("--fit")
+    })
+}
+
+fn llamacpp_binary_arg() -> PathBuf {
+    let name = format!("llama-cli{}", std::env::consts::EXE_SUFFIX);
+    if let Ok(dir) = std::env::var("LLAMA_CPP_PATH") {
+        let candidate = PathBuf::from(dir).join(&name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// Best-effort heuristic: checks use_case and name substrings to guess whether
+/// a model is conversational. May misfire on edge cases (e.g. an embedding model
+/// named "multichat", or a general-purpose model named "functionary").
+fn should_use_llamacpp_conversation_mode(fit: &ModelFit) -> bool {
+    use llmfit_core::models::{Capability, UseCase};
+
+    let name = fit.model.name.to_lowercase();
+    let use_case = fit.model.use_case.to_lowercase();
+
+    if fit.use_case == UseCase::Embedding
+        || use_case.contains("embedding")
+        || name.contains("embed")
+        || name.contains("bge")
+    {
+        return false;
+    }
+
+    fit.use_case == UseCase::Chat
+        || fit.model.capabilities.contains(&Capability::ToolUse)
+        || use_case.contains("chat")
+        || use_case.contains("instruct")
+        || use_case.contains("instruction")
+        || use_case.contains("tool")
+        || use_case.contains("function")
+        || name.contains("chat")
+        || name.contains("instruct")
+        || name.contains("-it")
+}
+
 /// Serialize diff output via serde derives (new diff-only path).
 pub fn display_json_diff_fits(specs: &SystemSpecs, fits: &[ModelFit]) {
     #[derive(serde::Serialize)]
@@ -552,6 +707,7 @@ fn fit_to_json(fit: &ModelFit) -> serde_json::Value {
         "parameter_count": fit.model.parameter_count,
         "params_b": round2(fit.model.params_b()),
         "context_length": fit.model.context_length,
+        "effective_context_length": fit.effective_context_length,
         "use_case": fit.model.use_case,
         "category": fit.use_case.label(),
         "release_date": fit.model.release_date,
@@ -766,4 +922,159 @@ pub fn display_csv_fits(fits: &[ModelFit]) {
     }
 
     writer.flush().expect("CSV flush failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llmfit_core::fit::{FitLevel, InferenceRuntime, ScoreComponents};
+    use llmfit_core::models::{Capability, GgufSource, ModelFormat, UseCase};
+
+    fn mock_fit(run_mode: RunMode, use_case: UseCase, model_use_case: &str) -> ModelFit {
+        ModelFit {
+            model: LlmModel {
+                name: "test/model-7b".to_string(),
+                provider: "test".to_string(),
+                parameter_count: "7B".to_string(),
+                parameters_raw: None,
+                min_ram_gb: 4.0,
+                recommended_ram_gb: 8.0,
+                min_vram_gb: Some(4.0),
+                quantization: "Q4_K_M".to_string(),
+                context_length: 131_072,
+                use_case: model_use_case.to_string(),
+                is_moe: false,
+                num_experts: None,
+                active_experts: None,
+                active_parameters: None,
+                release_date: None,
+                gguf_sources: vec![GgufSource {
+                    repo: "test/model-7b-GGUF".to_string(),
+                    provider: "test".to_string(),
+                }],
+                capabilities: vec![],
+                format: ModelFormat::Gguf,
+                num_attention_heads: None,
+                num_key_value_heads: None,
+                num_hidden_layers: None,
+                head_dim: None,
+                attention_layout: None,
+                license: None,
+                hidden_size: None,
+                moe_intermediate_size: None,
+                vocab_size: None,
+                shared_expert_intermediate_size: None,
+                architecture: None,
+            },
+            fit_level: FitLevel::Good,
+            run_mode,
+            memory_required_gb: 4.0,
+            memory_available_gb: 8.0,
+            utilization_pct: 50.0,
+            notes: vec![],
+            moe_offloaded_gb: None,
+            score: 80.0,
+            score_components: ScoreComponents {
+                quality: 80.0,
+                speed: 80.0,
+                fit: 80.0,
+                context: 80.0,
+            },
+            estimated_tps: 30.0,
+            best_quant: "Q4_K_M".to_string(),
+            use_case,
+            runtime: InferenceRuntime::LlamaCpp,
+            installed: false,
+            fits_with_turboquant: false,
+            effective_context_length: 8_192,
+        }
+    }
+
+    #[test]
+    fn llamacpp_command_uses_effective_context() {
+        let fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+
+        let command = generate_llamacpp_command(&fit).expect("expected command");
+
+        assert!(command.contains("-c 8192"));
+        assert!(!command.contains("-c 131072"));
+    }
+
+    #[test]
+    fn llamacpp_command_uses_cpu_only_ngl_zero() {
+        let fit = mock_fit(RunMode::CpuOnly, UseCase::General, "general");
+
+        let command = generate_llamacpp_command(&fit).expect("expected command");
+
+        assert!(command.contains("-ngl 0"));
+        assert!(!command.contains("-ngl all"));
+    }
+
+    #[test]
+    fn llamacpp_offload_ngl_args_use_fit_only_when_supported() {
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::CpuOffload, true),
+            Some("-ngl auto --fit on")
+        );
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::CpuOffload, false),
+            Some("-ngl auto")
+        );
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::MoeOffload, true),
+            Some("-ngl auto --fit on")
+        );
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::MoeOffload, false),
+            Some("-ngl auto")
+        );
+    }
+
+    #[test]
+    fn llamacpp_command_omits_conversation_for_embeddings() {
+        let fit = mock_fit(RunMode::Gpu, UseCase::Embedding, "embedding");
+
+        let command = generate_llamacpp_command(&fit).expect("expected command");
+
+        assert!(!command.contains("-cnv"));
+    }
+
+    #[test]
+    fn llamacpp_command_includes_conversation_for_chat_and_instruct() {
+        let chat = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        let instruct = mock_fit(RunMode::Gpu, UseCase::General, "instruction tuned");
+
+        let chat_command = generate_llamacpp_command(&chat).expect("expected command");
+        let instruct_command = generate_llamacpp_command(&instruct).expect("expected command");
+
+        assert!(chat_command.contains("-cnv"));
+        assert!(instruct_command.contains("-cnv"));
+    }
+
+    #[test]
+    fn llamacpp_command_includes_conversation_for_tool_use() {
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::General, "general");
+        fit.model.capabilities.push(Capability::ToolUse);
+
+        let command = generate_llamacpp_command(&fit).expect("expected command");
+
+        assert!(command.contains("-cnv"));
+    }
+
+    #[test]
+    fn llamacpp_command_omits_tensor_parallel_suggestion() {
+        let fit = mock_fit(RunMode::TensorParallel, UseCase::Chat, "chat");
+
+        assert!(generate_llamacpp_command(&fit).is_none());
+    }
+
+    #[test]
+    fn fit_json_includes_effective_context_length() {
+        let fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+
+        let json = fit_to_json(&fit);
+
+        assert_eq!(json["context_length"], 131_072);
+        assert_eq!(json["effective_context_length"], 8_192);
+    }
 }

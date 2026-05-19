@@ -17,9 +17,11 @@ use llmfit_core::models::{LlmModel, ModelDatabase, UseCase};
 use llmfit_core::plan::{PlanRequest, estimate_model_plan};
 use llmfit_core::providers::{
     DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider, ModelProvider,
-    OllamaProvider, PullEvent,
+    OllamaProvider, PullEvent, VllmProvider,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::serve_shared;
 
 include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 
@@ -425,6 +427,7 @@ async fn runtimes(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value
         )
     });
     set.spawn_blocking(|| ("lmstudio", LmStudioProvider::new().is_available()));
+    set.spawn_blocking(|| ("vllm", VllmProvider::new().is_available()));
 
     let mut runtimes = Vec::new();
     let mut warnings = Vec::new();
@@ -468,6 +471,10 @@ async fn installed(State(_state): State<Arc<AppState>>) -> Json<serde_json::Valu
     set.spawn_blocking(|| {
         let p = LmStudioProvider::new();
         ("lmstudio", p.is_available(), p.installed_models())
+    });
+    set.spawn_blocking(|| {
+        let p = VllmProvider::new();
+        ("vllm", p.is_available(), p.installed_models())
     });
 
     let mut models = Vec::new();
@@ -557,6 +564,7 @@ async fn start_download(
             "llamacpp" => LlamaCppProvider::new().start_pull(&model_name),
             "docker_model_runner" => DockerModelRunnerProvider::new().start_pull(&model_name),
             "lmstudio" => LmStudioProvider::new().start_pull(&model_name),
+            "vllm" => VllmProvider::new().start_pull(&model_name),
             other => {
                 let _ = event_tx.send(PullEvent::Error(format!("unknown runtime: {other}")));
                 return;
@@ -943,108 +951,12 @@ fn active_filters_json(query: &ModelsQuery, top_only: bool) -> serde_json::Value
     })
 }
 
-fn fit_level_code(fit_level: FitLevel) -> &'static str {
-    match fit_level {
-        FitLevel::Perfect => "perfect",
-        FitLevel::Good => "good",
-        FitLevel::Marginal => "marginal",
-        FitLevel::TooTight => "too_tight",
-    }
-}
-
-fn run_mode_code(run_mode: llmfit_core::fit::RunMode) -> &'static str {
-    match run_mode {
-        llmfit_core::fit::RunMode::Gpu => "gpu",
-        llmfit_core::fit::RunMode::TensorParallel => "tensor_parallel",
-        llmfit_core::fit::RunMode::MoeOffload => "moe_offload",
-        llmfit_core::fit::RunMode::CpuOffload => "cpu_offload",
-        llmfit_core::fit::RunMode::CpuOnly => "cpu_only",
-    }
-}
-
-fn runtime_code(runtime: InferenceRuntime) -> &'static str {
-    match runtime {
-        InferenceRuntime::Mlx => "mlx",
-        InferenceRuntime::LlamaCpp => "llamacpp",
-        InferenceRuntime::Vllm => "vllm",
-    }
-}
-
 fn system_json(specs: &SystemSpecs) -> serde_json::Value {
-    let gpus_json: Vec<serde_json::Value> = specs
-        .gpus
-        .iter()
-        .map(|g| {
-            serde_json::json!({
-                "name": g.name,
-                "vram_gb": g.vram_gb.map(round2),
-                "backend": g.backend.label(),
-                "count": g.count,
-                "unified_memory": g.unified_memory,
-            })
-        })
-        .collect();
-
-    serde_json::json!({
-        "total_ram_gb": round2(specs.total_ram_gb),
-        "available_ram_gb": round2(specs.available_ram_gb),
-        "cpu_cores": specs.total_cpu_cores,
-        "cpu_name": specs.cpu_name,
-        "has_gpu": specs.has_gpu,
-        "gpu_vram_gb": specs.gpu_vram_gb.map(round2),
-        "gpu_name": specs.gpu_name,
-        "gpu_count": specs.gpu_count,
-        "unified_memory": specs.unified_memory,
-        "backend": specs.backend.label(),
-        "gpus": gpus_json,
-    })
+    serve_shared::system_json(specs)
 }
 
 fn fit_to_json(fit: &ModelFit) -> serde_json::Value {
-    serde_json::json!({
-        "name": fit.model.name,
-        "provider": fit.model.provider,
-        "parameter_count": fit.model.parameter_count,
-        "params_b": round2(fit.model.params_b()),
-        "context_length": fit.model.context_length,
-        "use_case": fit.model.use_case,
-        "category": fit.use_case.label(),
-        "release_date": fit.model.release_date,
-        "is_moe": fit.model.is_moe,
-        "fit_level": fit_level_code(fit.fit_level),
-        "fit_label": fit.fit_text(),
-        "run_mode": run_mode_code(fit.run_mode),
-        "run_mode_label": fit.run_mode_text(),
-        "score": round1(fit.score),
-        "score_components": {
-            "quality": round1(fit.score_components.quality),
-            "speed": round1(fit.score_components.speed),
-            "fit": round1(fit.score_components.fit),
-            "context": round1(fit.score_components.context),
-        },
-        "estimated_tps": round1(fit.estimated_tps),
-        "runtime": runtime_code(fit.runtime),
-        "runtime_label": fit.runtime_text(),
-        "best_quant": fit.best_quant,
-        "memory_required_gb": round2(fit.memory_required_gb),
-        "memory_available_gb": round2(fit.memory_available_gb),
-        "moe_offloaded_gb": fit.moe_offloaded_gb.map(round2),
-        "total_memory_gb": round2(fit.memory_required_gb + fit.moe_offloaded_gb.unwrap_or(0.0)),
-        "utilization_pct": round1(fit.utilization_pct),
-        "notes": fit.notes,
-        "gguf_sources": fit.model.gguf_sources,
-        "capabilities": fit.model.capabilities,
-        "license": fit.model.license,
-        "supports_tp": fit.model.valid_tp_sizes(),
-    })
-}
-
-fn round1(v: f64) -> f64 {
-    (v * 10.0).round() / 10.0
-}
-
-fn round2(v: f64) -> f64 {
-    (v * 100.0).round() / 100.0
+    serve_shared::fit_to_json(fit)
 }
 
 #[cfg(test)]

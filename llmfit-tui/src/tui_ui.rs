@@ -5,16 +5,16 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Table, TableState, Wrap,
+        ScrollbarState, Table, Wrap,
     },
 };
 
 use crate::download_history::DownloadResult;
 use crate::theme::ThemeColors;
 use crate::tui_app::{
-    AdvConfigField, App, AvailabilityFilter, DL_DOCKER, DL_LLAMACPP, DL_LMSTUDIO, DL_OLLAMA,
-    DownloadCapability, DownloadManagerFocus, DownloadProvider, FitFilter, InputMode, PlanField,
-    SimulationField,
+    AdvConfigField, App, AvailabilityFilter, BenchViewMode, DL_DOCKER, DL_LLAMACPP, DL_LMSTUDIO,
+    DL_OLLAMA, DL_VLLM, DownloadCapability, DownloadManagerFocus, DownloadProvider, FitFilter,
+    InputMode, PlanField, SimulationField,
 };
 use llmfit_core::fit::{FitLevel, ModelFit, SortColumn};
 use llmfit_core::hardware::is_running_in_wsl;
@@ -42,7 +42,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_system_bar(frame, app, outer[0], &tc);
     draw_search_and_filters(frame, app, outer[1], &tc);
 
-    if app.show_downloads {
+    if app.show_bench {
+        draw_bench(frame, app, outer[2], &tc);
+    } else if app.show_benchmarks {
+        draw_benchmarks(frame, app, outer[2], &tc);
+    } else if app.show_downloads {
         draw_downloads(frame, app, outer[2], &tc);
     } else if app.show_plan {
         draw_plan(frame, app, outer[2], &tc);
@@ -193,6 +197,17 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         tc.muted
     };
 
+    let vllm_info = if app.vllm_available {
+        format!("vLLM: ✓ ({} models)", app.vllm_installed_count)
+    } else {
+        "vLLM: ✗".to_string()
+    };
+    let vllm_color = if app.vllm_available {
+        tc.good
+    } else {
+        tc.muted
+    };
+
     let mut hw_spans = Vec::new();
     if app.sim_active {
         hw_spans.push(Span::styled(
@@ -236,6 +251,8 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         Span::styled(docker_mr_info, Style::default().fg(docker_mr_color)),
         Span::styled("  │  ", Style::default().fg(tc.muted)),
         Span::styled(lmstudio_info, Style::default().fg(lmstudio_color)),
+        Span::styled("  │  ", Style::default().fg(tc.muted)),
+        Span::styled(vllm_info, Style::default().fg(vllm_color)),
     ];
 
     if app.backend_hidden_count > 0 {
@@ -304,7 +321,8 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         | InputMode::Simulation
         | InputMode::AdvancedConfig
         | InputMode::DownloadManager
-        | InputMode::FilterPopup => Style::default().fg(tc.muted),
+        | InputMode::FilterPopup
+        | InputMode::Benchmarks => Style::default().fg(tc.muted),
     };
 
     let search_text = if app.search_query.is_empty() && app.input_mode == InputMode::Normal {
@@ -565,6 +583,59 @@ fn pull_indicator(percent: Option<f64>, tick: u64) -> String {
     }
 }
 
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let head: String = chars.into_iter().take(max_chars - 1).collect();
+    format!("{}…", head)
+}
+
+fn marquee_text(text: &str, window_chars: usize, tick: u64) -> String {
+    if window_chars == 0 {
+        return String::new();
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= window_chars {
+        return text.to_string();
+    }
+
+    let pad = [' ', ' ', ' '];
+    let mut ring: Vec<char> = Vec::with_capacity(chars.len() * 2 + pad.len());
+    ring.extend(chars.iter().copied());
+    ring.extend(pad);
+    ring.extend(chars.iter().copied());
+
+    let cycle = chars.len() + pad.len();
+    let start = ((tick / 4) as usize) % cycle; // animate every x ticks, adjust speed as needed, default is 4
+    ring[start..start + window_chars].iter().collect()
+}
+
+fn model_col_text_width(area: Rect, widths: [Constraint; 14]) -> usize {
+    let inner = Rect {
+        x: 0,
+        y: 0,
+        width: area.width.saturating_sub(2), // account for table borders
+        height: 1,
+    };
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(widths)
+        .split(inner);
+
+    cols.get(2)
+        .map(|r| r.width.saturating_sub(1) as usize)
+        .unwrap_or(0)
+}
+
 fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     let sort_col = app.sort_column;
     let header_names = [
@@ -603,22 +674,30 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
     });
     let header = Row::new(header_cells).height(1);
 
-    let visible_rows = (area.height as usize).saturating_sub(3).max(1);
-    let total_rows = app.filtered_fits.len();
-    let viewport_start = if total_rows <= visible_rows || app.selected_row < visible_rows {
-        0
-    } else {
-        app.selected_row + 1 - visible_rows
-    };
-    let viewport_end = (viewport_start + visible_rows).min(total_rows);
-
     let visual_range = app.visual_range();
+    let widths = [
+        Constraint::Length(2),  // indicator
+        Constraint::Length(5),  // installed / pull %
+        Constraint::Min(20),    // model name
+        Constraint::Length(12), // provider
+        Constraint::Length(8),  // params
+        Constraint::Length(6),  // score
+        Constraint::Length(6),  // tok/s
+        Constraint::Length(10), // quant (AWQ-4bit, GPTQ-Int4, GPTQ-Int8)
+        Constraint::Length(7),  // mode
+        Constraint::Length(6),  // mem %
+        Constraint::Length(5),  // ctx
+        Constraint::Length(8),  // date (YYYY-MM)
+        Constraint::Length(10), // fit
+        Constraint::Min(10),    // use case
+    ];
+
+    let model_col_chars = model_col_text_width(area, widths);
+
     let rows: Vec<Row> = app
         .filtered_fits
         .iter()
         .enumerate()
-        .skip(viewport_start)
-        .take(viewport_end.saturating_sub(viewport_start))
         .map(|(row_idx, &idx)| {
             let fit = &app.all_fits[idx];
             let color = fit_color(fit.fit_level, tc);
@@ -676,6 +755,9 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
                             if flags & DL_LMSTUDIO != 0 {
                                 s.push('S');
                             }
+                            if flags & DL_VLLM != 0 {
+                                s.push('V');
+                            }
                             format!("{:>2}", s)
                         }
                     }
@@ -711,10 +793,16 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
                 fit_indicator(fit.fit_level).to_string()
             };
 
+            let model_text = if row_idx == app.selected_row {
+                marquee_text(&fit.model.name, model_col_chars, app.tick_count)
+            } else {
+                truncate_with_ellipsis(&fit.model.name, model_col_chars)
+            };
+
             Row::new(vec![
                 Cell::from(marker).style(Style::default().fg(color)),
                 Cell::from(installed_icon).style(Style::default().fg(installed_color)),
-                Cell::from(fit.model.name.clone()).style(Style::default().fg(tc.fg)),
+                Cell::from(model_text).style(Style::default().fg(tc.fg)),
                 Cell::from(fit.model.provider.clone()).style(Style::default().fg(tc.muted)),
                 Cell::from(fit.model.parameter_count.clone()).style(Style::default().fg(tc.fg)),
                 Cell::from(format!("{:.0}", fit.score)).style(Style::default().fg(score_color)),
@@ -786,12 +874,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
         )
         .highlight_symbol("▶ ");
 
-    let mut state = TableState::default();
-    if !app.filtered_fits.is_empty() {
-        state.select(Some(app.selected_row.saturating_sub(viewport_start)));
+    if app.filtered_fits.is_empty() {
+        app.table_state.select(None);
+    } else {
+        app.table_state.select(Some(app.selected_row));
     }
 
-    frame.render_stateful_widget(table, area, &mut state);
+    frame.render_stateful_widget(table, area, &mut app.table_state);
 
     // Empty-state hint when filters hide all models
     if app.filtered_fits.is_empty() && !app.all_fits.is_empty() {
@@ -1478,11 +1567,15 @@ fn draw_multi_compare(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors
     frame.render_widget(table, area);
 }
 
+/// Returns at most `max_len` characters of `s`, appending `~` if truncated.
+/// Uses char-aware slicing to avoid panics on multi-byte UTF-8 characters
+/// (e.g. CJK ideographs, emoji) that appear in HuggingFace model names.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}~", &s[..max_len.saturating_sub(1)])
+        let head: String = s.chars().take(max_len.saturating_sub(1)).collect();
+        format!("{head}~")
     }
 }
 
@@ -1615,11 +1708,15 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
                 {
                     installed_providers.push("LM Studio");
                 }
+                if providers::is_model_installed_vllm(&fit.model.name, &app.vllm_installed) {
+                    installed_providers.push("vLLM");
+                }
                 let any_available = app.ollama_available
                     || app.mlx_available
                     || app.llamacpp_available
                     || app.docker_mr_available
-                    || app.lmstudio_available;
+                    || app.lmstudio_available
+                    || app.vllm_available;
 
                 if !installed_providers.is_empty() {
                     let label = installed_providers
@@ -2629,6 +2726,7 @@ fn draw_download_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) 
             DownloadProvider::LlamaCpp => "llama.cpp",
             DownloadProvider::DockerModelRunner => "Docker Model Runner",
             DownloadProvider::LmStudio => "LM Studio",
+            DownloadProvider::Vllm => "vLLM",
         };
         let is_cursor = i == app.download_provider_cursor;
         let prefix = if is_cursor { ">" } else { " " };
@@ -2664,6 +2762,19 @@ fn draw_download_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) 
 fn status_keys_and_mode(app: &App) -> (String, String) {
     match app.input_mode {
         InputMode::Normal => {
+            if app.show_bench {
+                let keys = match app.bench_view_mode {
+                    BenchViewMode::Results => {
+                        if app.bench_show_detail {
+                            " j/k:scroll  Enter/q:close detail  r:routing".to_string()
+                        } else {
+                            " j/k:select  Enter:detail  r:routing  I:rerun  q:back".to_string()
+                        }
+                    }
+                    BenchViewMode::Routing => " r:results  q:back".to_string(),
+                };
+                return (keys, "INFERENCE BENCH".to_string());
+            }
             if app.show_multi_compare {
                 return (
                     " ←/→/hl:scroll  q/Esc:close".to_string(),
@@ -2679,7 +2790,8 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
                 || app.mlx_available
                 || app.llamacpp_available
                 || app.docker_mr_available
-                || app.lmstudio_available;
+                || app.lmstudio_available
+                || app.vllm_available;
             let ollama_keys = if any_provider {
                 let installed_key = if app.installed_first {
                     "i:all"
@@ -2692,7 +2804,7 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             };
             (
                 format!(
-                    " S:simulate  A:config  h:help  {}  /:search  f:fit  F:filter  s:sort{}  P:providers  U:use cases  C:caps  R:runtime  q:quit",
+                    " S:simulate  A:config  b:benchmarks  B:live-bench  h:help  {}  /:search  f:fit  F:filter  s:sort{}  P:providers  U:use cases  C:caps  R:runtime  q:quit",
                     detail_key, ollama_keys,
                 ),
                 if app.sim_active {
@@ -2789,6 +2901,10 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
                 .to_string(),
             "FILTER".to_string(),
         ),
+        InputMode::Benchmarks => (
+            " ↑/k:up  ↓/j:down  H:change GPU  r:refresh  b/q/Esc:close".to_string(),
+            "COMMUNITY LEADERBOARD".to_string(),
+        ),
     }
 }
 
@@ -2807,6 +2923,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         && !app.show_multi_compare
         && !app.show_plan
         && !app.show_downloads
+        && !app.show_benchmarks
     {
         if let Some(&idx) = app.filtered_fits.get(app.selected_row) {
             let fit = &app.all_fits[idx];
@@ -3155,6 +3272,12 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         ("  d", "Download/pull model"),
         ("  r", "Refresh installed models"),
         ("  p", "Plan mode"),
+        ("  b", "Community Leaderboard (localmaxxing.com)"),
+        (
+            "  I",
+            "Inference Bench (local quality scoring against your models)",
+        ),
+        ("  H", "Change GPU (in community leaderboard view)"),
         ("  y", "Copy model name"),
         ("", ""),
         ("Comparison", ""),
@@ -3887,6 +4010,279 @@ fn format_epoch(epoch: u64) -> String {
     format!("{:04}-{:02}-{:02}", y, m + 1, remaining + 1)
 }
 
+fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.accent))
+        .title(" Community Leaderboard ")
+        .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.bench_loading {
+        let loading = Paragraph::new(Line::from(Span::styled(
+            "  Loading benchmarks…",
+            Style::default().fg(tc.warning),
+        )));
+        frame.render_widget(loading, inner);
+        return;
+    }
+
+    if let Some(ref err) = app.bench_error {
+        let err_text = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "  Failed to fetch benchmarks:",
+                Style::default().fg(tc.error),
+            )),
+            Line::from(Span::styled(
+                format!("  {}", err),
+                Style::default().fg(tc.muted),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Press r to retry, or set LOCALMAXXING_API_KEY env var",
+                Style::default().fg(tc.muted),
+            )),
+        ]);
+        frame.render_widget(err_text, inner);
+        return;
+    }
+
+    if app.bench_entries.is_empty() && !app.bench_hw_picker_open {
+        let empty = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "  No benchmark results found for this hardware configuration.",
+                Style::default().fg(tc.muted),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Press H to pick a different GPU/chip",
+                Style::default().fg(tc.muted),
+            )),
+        ]);
+        frame.render_widget(empty, inner);
+        if app.bench_hw_picker_open {
+            draw_bench_hw_picker(frame, app, tc);
+        }
+        return;
+    }
+
+    // Header + summary line
+    let hw_desc = if let Some(ref label) = app.bench_hw_label {
+        label.clone()
+    } else {
+        app.specs
+            .gpu_name
+            .as_deref()
+            .unwrap_or(&app.specs.cpu_name)
+            .to_string()
+    };
+    let summary = Line::from(vec![
+        Span::styled("  Hardware: ", Style::default().fg(tc.muted)),
+        Span::styled(&hw_desc, Style::default().fg(tc.fg).bold()),
+        Span::styled(
+            format!("  ({} results)", app.bench_total),
+            Style::default().fg(tc.muted),
+        ),
+        Span::styled("  H:change GPU", Style::default().fg(tc.accent)),
+    ]);
+
+    // Table header
+    let header_cells = [
+        " Model",
+        "Engine",
+        "Quant",
+        "tok/s",
+        "Total t/s",
+        "TTFT",
+        "VRAM",
+        "Ctx",
+        "User",
+    ];
+    let header = Row::new(header_cells.iter().map(|h| {
+        Cell::from(*h).style(
+            Style::default()
+                .fg(tc.accent_secondary)
+                .add_modifier(Modifier::BOLD),
+        )
+    }))
+    .height(1);
+
+    let visible_height = inner.height.saturating_sub(3) as usize; // 1 summary + 1 header + 1 spacing
+    // Adjust scroll to keep cursor visible
+    if app.bench_cursor < app.bench_scroll {
+        app.bench_scroll = app.bench_cursor;
+    } else if app.bench_cursor >= app.bench_scroll + visible_height {
+        app.bench_scroll = app.bench_cursor.saturating_sub(visible_height - 1);
+    }
+
+    let rows: Vec<Row> = app
+        .bench_entries
+        .iter()
+        .enumerate()
+        .skip(app.bench_scroll)
+        .take(visible_height)
+        .map(|(i, entry)| {
+            let is_selected = i == app.bench_cursor;
+            let style = if is_selected {
+                Style::default().bg(tc.highlight_bg).fg(tc.fg)
+            } else {
+                Style::default().fg(tc.fg)
+            };
+
+            let tok_out = entry
+                .tok_s_out
+                .map(|v| format!("{:.1}", v))
+                .unwrap_or_default();
+            let tok_total = entry
+                .tok_s_total
+                .map(|v| format!("{:.1}", v))
+                .unwrap_or_default();
+            let ttft = entry
+                .ttft_ms
+                .map(|v| format!("{:.0}ms", v))
+                .unwrap_or_default();
+            let vram = entry
+                .peak_vram_gb
+                .map(|v| format!("{:.1}G", v))
+                .unwrap_or_default();
+            let ctx = entry
+                .context_length
+                .map(|v| format!("{}", v))
+                .unwrap_or_default();
+
+            let verified_marker = if entry.verified() { " *" } else { "" };
+            let user = format!("{}{}", entry.username(), verified_marker);
+
+            // Truncate model name to fit
+            let hf_id = entry.hf_id();
+            let max_name = 36;
+            let name = if hf_id.len() > max_name {
+                format!("{}…", &hf_id[..max_name - 1])
+            } else {
+                hf_id.to_string()
+            };
+
+            Row::new(vec![
+                Cell::from(format!(" {}", name)),
+                Cell::from(entry.engine_name()),
+                Cell::from(entry.quantization()),
+                Cell::from(tok_out).style(Style::default().fg(tc.good)),
+                Cell::from(tok_total),
+                Cell::from(ttft),
+                Cell::from(vram),
+                Cell::from(ctx),
+                Cell::from(user),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Min(28),    // Model
+        Constraint::Length(12), // Engine
+        Constraint::Length(10), // Quant
+        Constraint::Length(8),  // tok/s out
+        Constraint::Length(10), // Total t/s
+        Constraint::Length(8),  // TTFT
+        Constraint::Length(7),  // VRAM
+        Constraint::Length(6),  // Ctx
+        Constraint::Length(14), // User
+    ];
+
+    let table = Table::new(rows, widths).header(header);
+
+    // Layout: summary line, then table
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(inner);
+
+    frame.render_widget(Paragraph::new(summary), chunks[0]);
+    frame.render_widget(table, chunks[1]);
+
+    // Draw hardware picker popup overlay if open
+    if app.bench_hw_picker_open {
+        draw_bench_hw_picker(frame, app, tc);
+    }
+}
+
+fn draw_bench_hw_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
+    use llmfit_core::benchmarks::HardwarePreset;
+
+    let presets = HardwarePreset::all();
+    let area = frame.area();
+
+    // +3 for border + "My Hardware" entry + bottom hint
+    let popup_height = (presets.len() as u16 + 5).min(area.height.saturating_sub(6));
+    let popup_width = 42u16.min(area.width.saturating_sub(4));
+
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.accent))
+        .title(" Select Hardware ")
+        .title_style(Style::default().fg(tc.accent).add_modifier(Modifier::BOLD));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let inner_height = inner.height as usize;
+
+    // Total items: 1 ("My Hardware") + presets.len()
+    let total_items = 1 + presets.len();
+
+    // Scrolling: keep cursor in view
+    let scroll = if app.bench_hw_picker_cursor >= inner_height {
+        app.bench_hw_picker_cursor.saturating_sub(inner_height - 1)
+    } else {
+        0
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for i in scroll..total_items.min(scroll + inner_height) {
+        let is_selected = i == app.bench_hw_picker_cursor;
+        let marker = if is_selected { "▶ " } else { "  " };
+
+        let (label, is_current) = if i == 0 {
+            (
+                "My Hardware (auto-detect)".to_string(),
+                app.bench_hw_label.is_none(),
+            )
+        } else {
+            let p = &presets[i - 1];
+            (
+                p.label.to_string(),
+                app.bench_hw_label.as_deref() == Some(p.label),
+            )
+        };
+
+        let style = if is_selected {
+            Style::default().bg(tc.highlight_bg).fg(tc.fg)
+        } else if is_current {
+            Style::default().fg(tc.good)
+        } else {
+            Style::default().fg(tc.fg)
+        };
+
+        let check = if is_current { " ●" } else { "" };
+
+        lines.push(Line::from(Span::styled(
+            format!("{}{}{}", marker, label, check),
+            style,
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     use crate::tui_app::{FilterPopupField, FitFilter};
 
@@ -4074,5 +4470,718 @@ fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     let cursor_y = inner.y + field_row;
     if cursor_x < inner.x + inner.width {
         frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+// ── Live inference-bench view ─────────────────────────────────────────────
+
+fn bench_score_color(score: f64, tc: &ThemeColors) -> Color {
+    if score >= 8.0 {
+        tc.score_high
+    } else if score >= 6.0 {
+        tc.good
+    } else if score >= 4.0 {
+        tc.warning
+    } else {
+        tc.error
+    }
+}
+
+fn bench_bar(score: f64, width: usize) -> String {
+    let filled = ((score / 10.0) * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn bench_get_role_quality(
+    results: &[llmfit_core::quality::ModelQualityResult],
+    model: &str,
+    role: &str,
+) -> Option<f64> {
+    results
+        .iter()
+        .find(|r| r.model == model)
+        .and_then(|r| r.roles.iter().find(|rs| rs.role == role))
+        .map(|rs| rs.quality)
+}
+
+fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
+    let title = match app.bench_view_mode {
+        BenchViewMode::Results => {
+            if app.bench_show_detail {
+                " INFERENCE BENCH: Quality Benchmarks (j/k=scroll, Enter/q=close detail) "
+            } else {
+                " INFERENCE BENCH: Quality Benchmarks (j/k=select, Enter=detail, r=routing) "
+            }
+        }
+        BenchViewMode::Routing => " INFERENCE BENCH: Routing Matrix (r=results, q=back) ",
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.border))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Spinner frames for running state
+    let spinner_frames = [
+        "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}",
+        "\u{2827}", "\u{2807}", "\u{280f}",
+    ];
+    let spinner_char = spinner_frames[app.tick_count as usize % spinner_frames.len()];
+
+    match app.bench_view_mode {
+        BenchViewMode::Results => {
+            // Progress line on top, then table (+ optional detail below)
+            let progress_height = 1;
+            let progress_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: progress_height.min(inner.height),
+            };
+            let remaining = Rect {
+                x: inner.x,
+                y: inner.y + progress_area.height,
+                width: inner.width,
+                height: inner.height.saturating_sub(progress_area.height),
+            };
+
+            // ── Progress line ──
+            let spinner_display = if app.bench_running {
+                format!("{} ", spinner_char)
+            } else {
+                "✓ ".to_string()
+            };
+            let progress_text = if app.bench_running && app.bench_tests_total > 0 {
+                let pct =
+                    (app.bench_tests_done as f64 / app.bench_tests_total as f64 * 100.0) as usize;
+                format!(
+                    " {}{} [{}/{}] {}%",
+                    spinner_display,
+                    app.bench_progress,
+                    app.bench_tests_done,
+                    app.bench_tests_total,
+                    pct
+                )
+            } else {
+                format!(" {}{}", spinner_display, app.bench_progress)
+            };
+            let progress_line = Paragraph::new(Line::from(Span::styled(
+                progress_text,
+                Style::default().fg(if app.bench_running {
+                    tc.warning
+                } else {
+                    tc.good
+                }),
+            )));
+            frame.render_widget(progress_line, progress_area);
+
+            // ── Split remaining area: table top, detail bottom ──
+            let (table_area, detail_area) = if app.bench_show_detail {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                    .split(remaining);
+                (chunks[0], Some(chunks[1]))
+            } else {
+                (remaining, None)
+            };
+
+            // ── Build Table widget ──
+            if app.bench_model_status.is_empty() && !app.bench_running {
+                let empty_msg = Paragraph::new(Span::styled(
+                    "  No Ollama models found. Install models first: ollama pull <model>",
+                    Style::default().fg(tc.muted),
+                ));
+                frame.render_widget(empty_msg, table_area);
+            } else {
+                let header_style = Style::default().fg(tc.fg).add_modifier(Modifier::BOLD);
+                let header = Row::new(vec![
+                    Cell::from(""),
+                    Cell::from("Model"),
+                    Cell::from("Roles"),
+                    Cell::from("Quality"),
+                    Cell::from("Speed"),
+                    Cell::from("Comp"),
+                    Cell::from("Tools"),
+                    Cell::from("Agent"),
+                    Cell::from("Current"),
+                    Cell::from(""),
+                ])
+                .style(header_style)
+                .height(1)
+                .bottom_margin(0);
+
+                let selected_row = app.bench_selected_row;
+                let selected_style = Style::default()
+                    .bg(tc.highlight_bg)
+                    .fg(tc.fg)
+                    .add_modifier(Modifier::BOLD);
+
+                let agentic_roles_list = [
+                    "tool-calling",
+                    "structured-output",
+                    "code-editing",
+                    "error-recovery",
+                    "planning",
+                    "long-context",
+                ];
+
+                let rows: Vec<Row> = app
+                    .bench_model_status
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ms)| {
+                        let result = app.bench_results.iter().find(|r| r.model == ms.name);
+
+                        let marker = if i == selected_row { "▶" } else { " " };
+
+                        let roles_str = format!("{}/{}", ms.roles_done, ms.roles_total);
+                        let roles_color = if ms.roles_done > 0 { tc.info } else { tc.muted };
+
+                        let q_str = result
+                            .map(|r| format!("{:.1}", r.overall_quality))
+                            .unwrap_or_else(|| "—".into());
+                        let q_color = result
+                            .map(|r| bench_score_color(r.overall_quality, tc))
+                            .unwrap_or(tc.muted);
+
+                        let s_str = result
+                            .map(|r| format!("{:.1}t/s", r.overall_speed))
+                            .unwrap_or_else(|| "—".into());
+
+                        let c_str = result
+                            .map(|r| format!("{:.1}", r.overall_composite))
+                            .unwrap_or_else(|| "—".into());
+                        let c_color = result
+                            .map(|r| bench_score_color(r.overall_composite, tc))
+                            .unwrap_or(tc.muted);
+
+                        let tools_str =
+                            bench_get_role_quality(&app.bench_results, &ms.name, "tool-calling")
+                                .map(|v| format!("{:.1}", v))
+                                .unwrap_or_else(|| "—".into());
+                        let tools_color =
+                            bench_get_role_quality(&app.bench_results, &ms.name, "tool-calling")
+                                .map(|v| bench_score_color(v, tc))
+                                .unwrap_or(tc.muted);
+
+                        let agent_val = result.and_then(|r| {
+                            let scores: Vec<f64> = r
+                                .roles
+                                .iter()
+                                .filter(|rs| agentic_roles_list.contains(&rs.role.as_str()))
+                                .map(|rs| rs.composite)
+                                .collect();
+                            if scores.is_empty() {
+                                None
+                            } else {
+                                Some(scores.iter().sum::<f64>() / scores.len() as f64)
+                            }
+                        });
+                        let agent_str = agent_val
+                            .map(|v| format!("{:.1}", v))
+                            .unwrap_or_else(|| "—".into());
+                        let agent_color = agent_val
+                            .map(|v| bench_score_color(v, tc))
+                            .unwrap_or(tc.muted);
+
+                        let current = if ms.state == crate::tui_app::BenchModelState::Running {
+                            ms.current_role.clone()
+                        } else if ms.state == crate::tui_app::BenchModelState::Complete {
+                            "done".into()
+                        } else {
+                            String::new()
+                        };
+                        let current_color = if ms.state == crate::tui_app::BenchModelState::Running
+                        {
+                            tc.accent
+                        } else {
+                            tc.muted
+                        };
+
+                        let status_icon = match ms.state {
+                            crate::tui_app::BenchModelState::Pending => "⏳".to_string(),
+                            crate::tui_app::BenchModelState::Running => spinner_char.to_string(),
+                            crate::tui_app::BenchModelState::Complete => "✓".to_string(),
+                            crate::tui_app::BenchModelState::Error => "✗".to_string(),
+                        };
+                        let status_color = match ms.state {
+                            crate::tui_app::BenchModelState::Complete => tc.good,
+                            crate::tui_app::BenchModelState::Running => tc.accent,
+                            crate::tui_app::BenchModelState::Error => tc.error,
+                            _ => tc.muted,
+                        };
+
+                        let row_style = if i == selected_row {
+                            selected_style
+                        } else {
+                            Style::default()
+                        };
+
+                        Row::new(vec![
+                            Cell::from(Span::styled(
+                                marker,
+                                if i == selected_row {
+                                    selected_style
+                                } else {
+                                    Style::default().fg(tc.accent)
+                                },
+                            )),
+                            Cell::from(Span::styled(
+                                ms.name.clone(),
+                                if i == selected_row {
+                                    selected_style
+                                } else {
+                                    Style::default().fg(tc.fg)
+                                },
+                            )),
+                            Cell::from(Span::styled(
+                                roles_str,
+                                if i == selected_row {
+                                    selected_style
+                                } else {
+                                    Style::default().fg(roles_color)
+                                },
+                            )),
+                            Cell::from(Span::styled(
+                                q_str,
+                                if i == selected_row {
+                                    selected_style
+                                } else {
+                                    Style::default().fg(q_color)
+                                },
+                            )),
+                            Cell::from(Span::styled(
+                                s_str,
+                                if i == selected_row {
+                                    selected_style
+                                } else {
+                                    Style::default().fg(tc.accent)
+                                },
+                            )),
+                            Cell::from(Span::styled(
+                                c_str,
+                                if i == selected_row {
+                                    selected_style
+                                } else {
+                                    Style::default().fg(c_color)
+                                },
+                            )),
+                            Cell::from(Span::styled(
+                                tools_str,
+                                if i == selected_row {
+                                    selected_style
+                                } else {
+                                    Style::default().fg(tools_color)
+                                },
+                            )),
+                            Cell::from(Span::styled(
+                                agent_str,
+                                if i == selected_row {
+                                    selected_style
+                                } else {
+                                    Style::default().fg(agent_color)
+                                },
+                            )),
+                            Cell::from(Span::styled(
+                                current,
+                                if i == selected_row {
+                                    selected_style
+                                } else {
+                                    Style::default().fg(current_color)
+                                },
+                            )),
+                            Cell::from(Span::styled(
+                                status_icon,
+                                if i == selected_row {
+                                    selected_style
+                                } else {
+                                    Style::default().fg(status_color)
+                                },
+                            )),
+                        ])
+                        .style(row_style)
+                    })
+                    .collect();
+
+                let widths = [
+                    Constraint::Length(2),
+                    Constraint::Min(18),
+                    Constraint::Length(6),
+                    Constraint::Length(7),
+                    Constraint::Length(8),
+                    Constraint::Length(6),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Length(12),
+                    Constraint::Length(3),
+                ];
+
+                let table = Table::new(rows, widths)
+                    .header(header)
+                    .row_highlight_style(selected_style)
+                    .highlight_symbol("▶ ");
+
+                frame.render_widget(table, table_area);
+            }
+
+            // ── Detail pane (when open) ──
+            if let Some(det_area) = detail_area {
+                if let Some(ms) = app.bench_model_status.get(app.bench_selected_row) {
+                    let result = app.bench_results.iter().find(|r| r.model == ms.name);
+
+                    let mut detail_lines: Vec<Line> = Vec::new();
+
+                    if let Some(result) = result {
+                        detail_lines.push(Line::from(vec![
+                            Span::styled("  Model: ", Style::default().fg(tc.muted)),
+                            Span::styled(
+                                &result.model,
+                                Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                        detail_lines.push(Line::from(Span::styled(
+                            format!(
+                                "  Overall: Q:{:.1}  S:{:.1} t/s  C:{:.1}  |  Tests: {}  Roles: {}",
+                                result.overall_quality,
+                                result.overall_speed,
+                                result.overall_composite,
+                                result.test_results.len(),
+                                result.roles.len()
+                            ),
+                            Style::default().fg(tc.fg),
+                        )));
+                        detail_lines.push(Line::from(""));
+
+                        // ── Role summary table ──
+                        let bold_style = Style::default().fg(tc.fg).add_modifier(Modifier::BOLD);
+                        detail_lines.push(Line::from(vec![
+                            Span::styled("  ", Style::default()),
+                            Span::styled(format!("{:<16}", "Role"), bold_style),
+                            Span::styled(format!("{:>5}", "Qual"), bold_style),
+                            Span::styled(format!("{:>9}", "Speed"), bold_style),
+                            Span::styled(format!("{:>7}", "Comp"), bold_style),
+                            Span::styled(format!("{:>8}", "TTFT"), bold_style),
+                            Span::styled("  Bar", bold_style),
+                        ]));
+                        detail_lines.push(Line::from(Span::styled(
+                            format!("  {}", "─".repeat(60)),
+                            Style::default().fg(tc.border),
+                        )));
+
+                        for rs in &result.roles {
+                            let q_color = bench_score_color(rs.quality, tc);
+                            let c_color = bench_score_color(rs.composite, tc);
+                            let bar = bench_bar(rs.composite, 15);
+
+                            let role_tests: Vec<&llmfit_core::quality::QualityResult> = result
+                                .test_results
+                                .iter()
+                                .filter(|t| t.role == rs.role)
+                                .collect();
+                            let avg_ttft = if role_tests.is_empty() {
+                                0.0
+                            } else {
+                                role_tests.iter().filter_map(|t| t.ttft_ms).sum::<f64>()
+                                    / role_tests
+                                        .iter()
+                                        .filter(|t| t.ttft_ms.is_some())
+                                        .count()
+                                        .max(1) as f64
+                            };
+
+                            detail_lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("  {:<16}", rs.role),
+                                    Style::default().fg(tc.fg),
+                                ),
+                                Span::styled(
+                                    format!("{:>5.1}", rs.quality),
+                                    Style::default().fg(q_color),
+                                ),
+                                Span::styled(
+                                    format!("{:>7.1}t/s", rs.speed),
+                                    Style::default().fg(tc.accent_secondary),
+                                ),
+                                Span::styled(
+                                    format!("{:>7.1}", rs.composite),
+                                    Style::default().fg(c_color),
+                                ),
+                                Span::styled(
+                                    if avg_ttft > 0.0 {
+                                        format!("{:>6.0}ms", avg_ttft)
+                                    } else {
+                                        format!("{:>8}", "—")
+                                    },
+                                    Style::default().fg(tc.muted),
+                                ),
+                                Span::styled(format!("  {}", bar), Style::default().fg(c_color)),
+                            ]));
+                        }
+
+                        // ── Full test rubric grouped by role ──
+                        if !result.test_results.is_empty() {
+                            detail_lines.push(Line::from(""));
+                            detail_lines.push(Line::from(Span::styled(
+                                "  ── Full Test Rubric ──",
+                                Style::default().fg(tc.title).add_modifier(Modifier::BOLD),
+                            )));
+                            detail_lines.push(Line::from(""));
+
+                            let mut current_role = String::new();
+                            for t in &result.test_results {
+                                if t.role != current_role {
+                                    if !current_role.is_empty() {
+                                        detail_lines.push(Line::from(Span::styled(
+                                            "  └────────────────────────────────────────────────",
+                                            Style::default().fg(tc.border),
+                                        )));
+                                    }
+                                    current_role = t.role.clone();
+                                    detail_lines.push(Line::from(vec![
+                                        Span::styled(
+                                            format!("  ┌─ {} ", t.role.to_uppercase()),
+                                            Style::default()
+                                                .fg(tc.accent)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            "─".repeat(50),
+                                            Style::default().fg(tc.border),
+                                        ),
+                                    ]));
+                                }
+
+                                let q_color = bench_score_color(t.quality, tc);
+                                let status = if t.error.is_some() {
+                                    "ERR"
+                                } else if t.quality >= 7.0 {
+                                    " ✓ "
+                                } else if t.quality >= 4.0 {
+                                    " ~ "
+                                } else {
+                                    " ✗ "
+                                };
+                                let status_color = if t.error.is_some() {
+                                    tc.error
+                                } else if t.quality >= 7.0 {
+                                    tc.good
+                                } else if t.quality >= 4.0 {
+                                    tc.warning
+                                } else {
+                                    tc.error
+                                };
+
+                                detail_lines.push(Line::from(vec![
+                                    Span::styled(
+                                        format!("  │  {:<28}", t.test_name),
+                                        Style::default().fg(tc.fg),
+                                    ),
+                                    Span::styled(status, Style::default().fg(status_color)),
+                                    Span::styled(
+                                        format!("  Q:{:>4.1}", t.quality),
+                                        Style::default().fg(q_color),
+                                    ),
+                                    Span::styled(
+                                        format!("  {:>6.1}t/s", t.tok_per_sec),
+                                        Style::default().fg(tc.muted),
+                                    ),
+                                    Span::styled(
+                                        format!("  {:>5.1}s", t.wall_time_sec),
+                                        Style::default().fg(tc.muted),
+                                    ),
+                                ]));
+
+                                if let Some(e) = &t.error {
+                                    detail_lines.push(Line::from(Span::styled(
+                                        format!("  │      Error: {}", e),
+                                        Style::default().fg(tc.error),
+                                    )));
+                                } else if !t.response_preview.is_empty() {
+                                    detail_lines.push(Line::from(Span::styled(
+                                        format!("  │      Preview: {}…", &t.response_preview),
+                                        Style::default().fg(tc.muted),
+                                    )));
+                                }
+                            }
+                            if !result.test_results.is_empty() {
+                                detail_lines.push(Line::from(Span::styled(
+                                    "  └────────────────────────────────────────────────",
+                                    Style::default().fg(tc.border),
+                                )));
+                            }
+                        }
+                    } else {
+                        detail_lines.push(Line::from(Span::styled(
+                            format!("  {} — pending or no results yet.", ms.name),
+                            Style::default().fg(tc.muted),
+                        )));
+                    }
+
+                    let scroll = app.live_bench_scroll as u16;
+                    let paragraph = Paragraph::new(detail_lines)
+                        .scroll((scroll, 0))
+                        .wrap(Wrap { trim: false });
+                    frame.render_widget(paragraph, det_area);
+                }
+            }
+        }
+
+        BenchViewMode::Routing => {
+            let mut lines: Vec<Line> = Vec::new();
+
+            // Progress line at top
+            let spinner_display = if app.bench_running {
+                format!("{} ", spinner_char)
+            } else {
+                "✓ ".to_string()
+            };
+            let progress_text = if app.bench_running && app.bench_tests_total > 0 {
+                let pct =
+                    (app.bench_tests_done as f64 / app.bench_tests_total as f64 * 100.0) as usize;
+                format!(
+                    " {}{} [{}/{}] {}%",
+                    spinner_display,
+                    app.bench_progress,
+                    app.bench_tests_done,
+                    app.bench_tests_total,
+                    pct
+                )
+            } else {
+                format!(" {}{}", spinner_display, app.bench_progress)
+            };
+            lines.push(Line::from(Span::styled(
+                progress_text,
+                Style::default().fg(if app.bench_running {
+                    tc.warning
+                } else {
+                    tc.good
+                }),
+            )));
+            lines.push(Line::from(""));
+
+            if app.bench_routing.is_empty() {
+                let msg = if app.bench_running {
+                    "  Waiting for results to compute routing..."
+                } else {
+                    "  No routing data. Need at least one benchmark result."
+                };
+                lines.push(Line::from(Span::styled(msg, Style::default().fg(tc.muted))));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  Role              Best Model                       Quality  Speed   Comp",
+                    Style::default().fg(tc.muted),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  ─────────────────────────────────────────────────────────────────────────",
+                    Style::default().fg(tc.muted),
+                )));
+
+                for rec in &app.bench_routing {
+                    let c_color = bench_score_color(rec.composite, tc);
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {:<18}", rec.role), Style::default().fg(tc.fg)),
+                        Span::styled(format!("{:<33}", rec.model), Style::default().fg(tc.accent)),
+                        Span::styled(
+                            format!("{:>5.1}", rec.quality),
+                            Style::default().fg(bench_score_color(rec.quality, tc)),
+                        ),
+                        Span::styled(
+                            format!("  {:>5.1}", rec.speed),
+                            Style::default().fg(tc.muted),
+                        ),
+                        Span::styled(
+                            format!("  {:>5.1}", rec.composite),
+                            Style::default().fg(c_color),
+                        ),
+                    ]));
+                }
+
+                // Runner-ups
+                if !app.bench_runner_ups.is_empty() {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "  Runner-ups:",
+                        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                    )));
+                    for rec in &app.bench_runner_ups {
+                        let note = rec
+                            .note
+                            .as_deref()
+                            .map(|n| format!("  ({})", n))
+                            .unwrap_or_default();
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  {:<18}", rec.role), Style::default().fg(tc.fg)),
+                            Span::styled(
+                                format!("{:<33}", rec.model),
+                                Style::default().fg(tc.muted),
+                            ),
+                            Span::styled(
+                                format!("{:>5.1}", rec.quality),
+                                Style::default().fg(bench_score_color(rec.quality, tc)),
+                            ),
+                            Span::styled(
+                                format!("  {:>5.1}", rec.speed),
+                                Style::default().fg(tc.muted),
+                            ),
+                            Span::styled(
+                                format!("  {:>5.1}", rec.composite),
+                                Style::default().fg(bench_score_color(rec.composite, tc)),
+                            ),
+                            Span::styled(note, Style::default().fg(tc.warning)),
+                        ]));
+                    }
+                }
+
+                // Amplifier YAML snippet
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  -- Amplifier YAML --",
+                    Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  routing:",
+                    Style::default().fg(tc.fg),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "    ollama:",
+                    Style::default().fg(tc.fg),
+                )));
+                for rec in &app.bench_routing {
+                    lines.push(Line::from(Span::styled(
+                        format!("      {}: {}", rec.role, rec.model),
+                        Style::default().fg(tc.fg),
+                    )));
+                }
+            }
+
+            let scroll = app.live_bench_scroll as u16;
+            let paragraph = Paragraph::new(lines)
+                .scroll((scroll, 0))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, inner);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_str_handles_multibyte_utf8() {
+        // ASCII — no truncation needed
+        assert_eq!(truncate_str("hello", 10), "hello");
+        // ASCII — truncation with tilde marker
+        assert_eq!(truncate_str("hello world", 5), "hell~");
+        // CJK ideographs (3-byte UTF-8 each) — must not panic
+        assert_eq!(truncate_str("こんにちは世界", 4), "こんに~");
+        // Single emoji (4-byte UTF-8) — must not panic on byte boundary
+        assert_eq!(truncate_str("🚀 hello", 4), "🚀 h~");
+        // Exact max length — no truncation
+        assert_eq!(truncate_str("abc", 3), "abc");
     }
 }

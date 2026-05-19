@@ -16,7 +16,7 @@
   <a href="https://about.signpath.io"><img src="https://img.shields.io/badge/SignPath-signed-brightgreen?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0id2hpdGUiIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggZD0iTTEwLjA2NyA0LjU2N2wtNC43MzQgNC43MzMtMS40LTEuNGExIDEgMCAwIDAtMS40MTQgMS40MTRsMi4xIDIuMWExIDEgMCAwIDAgMS40MTQgMGw1LjQ0LTUuNDRhMSAxIDAgMCAwLTEuNDE0LTEuNDE0eiIvPjwvc3ZnPg==" alt="Signed with SignPath"></a>
 </p>
 
-> **Windows binaries are now code-signed!** All Windows releases are signed via [SignPath Foundation](https://signpath.org), providing Authenticode signatures so you can trust that downloads haven't been tampered with.
+> **New: [Community Leaderboard](#community-leaderboard-b)** — Browse real-world performance data from actual users. Press `b` to see measured tok/s, TTFT, and VRAM for any GPU — not just yours. Pick from 27+ hardware presets (RTX 5090 to Apple M1) with `H` to compare real numbers before you buy or build.
 
 **Hundreds of models & providers. One command to find what runs on your hardware.**
 
@@ -24,7 +24,9 @@ A terminal tool that right-sizes LLM models to your system's RAM, CPU, and GPU. 
 
 Ships with an interactive TUI (default) and a classic CLI mode. Supports multi-GPU setups, MoE architectures, dynamic quantization selection, speed estimation, and local runtime providers (Ollama, llama.cpp, MLX, Docker Model Runner, LM Studio).
 
-**New: [Download Manager](#download-manager-d) (`D`), [Advanced Configuration](#advanced-configuration-a) (`A`), and [Hardware Simulation](#hardware-simulation-s)** — Press `D` to manage downloads, view history, delete models, and configure the download directory. Press `A` to tune TPS efficiency, run mode factors, and scoring weights. Press `S` to simulate different hardware.
+**New: [Community Leaderboard](#community-leaderboard-b) (`b`)** — See real-world tok/s, TTFT, and VRAM usage from other users running the same hardware as you. Powered by [localmaxxing.com](https://localmaxxing.com), this bridges the gap between estimated and actual performance.
+
+Also: [Download Manager](#download-manager-d) (`D`), [Advanced Configuration](#advanced-configuration-a) (`A`), and [Hardware Simulation](#hardware-simulation-s) — Press `D` to manage downloads, view history, delete models, and configure the download directory. Press `A` to tune TPS efficiency, run mode factors, and scoring weights. Press `S` to simulate different hardware.
 
 > **Sister projects:**
 > - [sympozium](https://github.com/sympozium-ai/sympozium/) — managing agents in Kubernetes.
@@ -51,7 +53,7 @@ If Scoop is not installed, follow the [Scoop installation guide](https://scoop.s
 brew install llmfit
 ```
 
-### MacPorts
+#### MacPorts
 ```sh
 port install llmfit
 ```
@@ -67,6 +69,19 @@ Downloads the latest release binary from GitHub and installs it to `/usr/local/b
 ```sh
 curl -fsSL https://llmfit.axjns.dev/install.sh | sh -s -- --local
 ```
+
+### uv / pip
+To install or update llmfit:
+```sh
+uv tool install -U llmfit
+```
+
+To run without installing:
+```sh
+uvx llmfit
+```
+
+You can also install llmfit as a Python package in the normal way with tools such as pip or uv.
 
 ### Docker / Podman
 ```sh
@@ -117,6 +132,8 @@ Launches the interactive terminal UI. Your system specs (CPU, RAM, GPU name, VRA
 | `R`                        | Open runtime/backend filter popup (llama.cpp, MLX, vLLM)             |
 | `S`                        | Open hardware simulation popup (override RAM/VRAM/CPU)                |
 | `A`                        | Open advanced configuration popup (tune efficiency, run mode factors) |
+| `b`                        | Open community leaderboard view (localmaxxing.com)                    |
+| `I`                        | Open inference bench view (local quality scoring against your models) |
 | `h`                        | Open help popup (all key bindings)                                    |
 | `m`                        | Mark selected model for compare                                       |
 | `c`                        | Open compare view (marked vs selected)                                |
@@ -252,6 +269,106 @@ Use `Tab` / `Shift-Tab` to cycle focus between sections.
 | `Esc` / `D` / `q`    | Close and return to the model table               |
 
 For failed downloads (e.g. 404 errors), `x` removes the entry from history. For successful downloads, it deletes the model from the provider (supported for Ollama and llama.cpp).
+
+### Community Leaderboard (`b`)
+
+Press `b` to open the Community Leaderboard view. Instead of relying solely on llmfit's theoretical speed estimates, this view shows **real-world performance data** from other users with the same hardware — actual measured tok/s, time-to-first-token, and peak VRAM usage.
+
+![Community Leaderboard](assets/benchmark.jpeg)
+
+Data is sourced from [localmaxxing.com](https://localmaxxing.com), a community benchmark database. When you open the view, llmfit auto-detects your hardware (GPU model, VRAM tier, Apple Silicon chip family, OS) and queries for matching results.
+
+| Column       | Description                                              |
+|--------------|----------------------------------------------------------|
+| **Model**    | HuggingFace model ID                                     |
+| **Engine**   | Inference runtime used (llama.cpp, vLLM, Ollama, MLX...) |
+| **Quant**    | Quantization format (Q4_K_M, Q8_0, etc.)                |
+| **tok/s**    | Measured output token generation speed                   |
+| **Total t/s**| Total throughput (prompt + generation)                   |
+| **TTFT**     | Time to first token (latency)                            |
+| **VRAM**     | Peak memory usage during inference                       |
+| **Ctx**      | Context length used in the benchmark                     |
+| **User**     | Submitter (verified users marked with `*`)               |
+
+| Key                    | Action                                  |
+|------------------------|-----------------------------------------|
+| `j` / `k` or arrows   | Navigate results                        |
+| `H`                    | Open hardware picker (browse any GPU)   |
+| `r`                    | Refresh / re-fetch from API             |
+| `b` / `q` / `Esc`     | Close and return to model table         |
+
+Press `H` to open the hardware picker — a scrollable list of 27 popular GPUs and chips (RTX 5090 through CPU-only, plus Apple Silicon M1–M4 variants, AMD RX/MI series, and NVIDIA datacenter cards). Select one to instantly load benchmarks for that hardware, even if it's not what you're running on. Select "My Hardware (auto-detect)" to go back to your own system.
+
+#### API key setup
+
+Public benchmarks work without authentication. For full access, provide your [localmaxxing.com](https://localmaxxing.com) API key:
+
+```sh
+# Via environment variable (recommended)
+export LOCALMAXXING_API_KEY="bhk_your_key_here"
+llmfit
+
+# Or via CLI flag
+llmfit --api-key "bhk_your_key_here"
+```
+
+| Variable | Description |
+|---|---|
+| `LOCALMAXXING_API_KEY` | Bearer token for localmaxxing.com API |
+
+### Inference Bench (`I`)
+
+Press `I` (uppercase) to open the Inference Bench view. This runs **live inference benchmarks against your locally running providers** — Ollama, vLLM, and MLX — measuring time-to-first-token (TTFT), tokens per second (TPS), and total latency with real inference requests.
+
+Unlike the Community Leaderboard (which shows crowd-sourced data from other users), Inference Bench measures your actual hardware with your actual models.
+
+#### TUI usage
+
+| Key | Action |
+|-----|--------|
+| `I` | Open inference bench (auto-detects provider and runs benchmarks) |
+| `I` (again) | Rerun benchmarks from within the bench view |
+| `j` / `k` or arrows | Navigate model results |
+| `Enter` | Open detail view for selected model |
+| `r` | Switch to routing matrix view |
+| `q` / `Esc` | Close bench view |
+
+Results are cached to `~/.config/llmfit/bench-cache.json` and loaded instantly on subsequent opens.
+
+#### CLI usage
+
+```sh
+# Auto-detect provider and benchmark
+llmfit bench
+
+# Benchmark all discovered models across all running providers
+llmfit bench --all
+
+# Benchmark a specific model via Ollama
+llmfit bench --provider ollama llama3.2
+
+# Override endpoint URL
+llmfit bench --provider ollama --url http://my-server:11434 llama3.2
+
+# Override vLLM endpoint
+llmfit bench --provider vllm --url http://localhost:8000
+
+# Output as JSON (for scripting)
+llmfit bench --json
+
+# Run quality benchmarks (role-based scoring for routing)
+llmfit bench --quality
+
+# Output routing matrix
+llmfit bench --quality --routing
+```
+
+#### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama API base URL |
+| `VLLM_PORT` | `8000` | vLLM server port (used as `http://localhost:$VLLM_PORT`) |
 
 ### Themes
 

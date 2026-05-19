@@ -4,15 +4,49 @@ use llmfit_core::models::{Capability, ModelDatabase, UseCase};
 use llmfit_core::plan::{PlanEstimate, PlanRequest, estimate_model_plan};
 use llmfit_core::providers::{
     self, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
-    ModelProvider, OllamaProvider, PullEvent, PullHandle,
+    ModelProvider, OllamaProvider, PullEvent, PullHandle, VllmProvider,
 };
+use llmfit_core::quality;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
+use std::thread;
+
+use ratatui::widgets::TableState;
 
 use crate::download_history::{DownloadHistory, DownloadRecord, DownloadResult};
 use crate::filter_config::FilterConfig;
 use crate::theme::Theme;
+
+/// Messages sent from background provider-detection threads back to the main TUI.
+pub enum ProviderDetectionMsg {
+    Ollama {
+        available: bool,
+        binary_available: bool,
+        installed: HashSet<String>,
+        installed_count: usize,
+        provider: OllamaProvider,
+    },
+    Mlx {
+        available: bool,
+        installed: HashSet<String>,
+    },
+    DockerMr {
+        available: bool,
+        installed: HashSet<String>,
+        installed_count: usize,
+    },
+    LmStudio {
+        available: bool,
+        installed: HashSet<String>,
+        installed_count: usize,
+    },
+    Vllm {
+        available: bool,
+        installed: HashSet<String>,
+        installed_count: usize,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
@@ -35,6 +69,7 @@ pub enum InputMode {
     AdvancedConfig,
     DownloadManager,
     FilterPopup,
+    Benchmarks,
 }
 
 /// Fields in the Filter Popup modal.
@@ -199,6 +234,55 @@ impl PlanField {
     }
 }
 
+/// Live-bench view mode (tab between results summary and routing matrix).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchViewMode {
+    Results,
+    Routing,
+}
+
+/// Messages sent from the bench worker thread to the UI.
+#[allow(dead_code)]
+pub enum BenchMsg {
+    Progress(String),
+    ModelStarted(String),
+    TestDone {
+        model: String,
+        role: String,
+        test_name: String,
+    },
+    RoleDone {
+        model: String,
+        role: String,
+        quality: f64,
+        speed: f64,
+        tests_in_role: usize,
+    },
+    ModelDone(quality::ModelQualityResult),
+    AllDone,
+}
+
+/// Per-model bench status for the live dashboard rows.
+#[derive(Debug, Clone)]
+pub struct BenchModelStatus {
+    pub name: String,
+    pub state: BenchModelState,
+    pub roles_done: usize,
+    pub roles_total: usize,
+    pub current_role: String,
+    pub last_quality: f64,
+    pub last_speed: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum BenchModelState {
+    Pending,
+    Running,
+    Complete,
+    Error,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FitFilter {
     All,
@@ -335,6 +419,7 @@ pub enum DownloadProvider {
     LlamaCpp,
     DockerModelRunner,
     LmStudio,
+    Vllm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +433,7 @@ pub const DL_OLLAMA: u8 = 0b0001;
 pub const DL_LLAMACPP: u8 = 0b0010;
 pub const DL_DOCKER: u8 = 0b0100;
 pub const DL_LMSTUDIO: u8 = 0b1000;
+pub const DL_VLLM: u8 = 0b1_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivePullProvider {
@@ -356,6 +442,7 @@ enum ActivePullProvider {
     LlamaCpp,
     DockerModelRunner,
     LmStudio,
+    Vllm,
 }
 
 impl ActivePullProvider {
@@ -366,6 +453,7 @@ impl ActivePullProvider {
             ActivePullProvider::LlamaCpp => "llama.cpp",
             ActivePullProvider::DockerModelRunner => "Docker",
             ActivePullProvider::LmStudio => "LM Studio",
+            ActivePullProvider::Vllm => "vLLM",
         }
     }
 }
@@ -410,6 +498,7 @@ pub struct App {
 
     // Table state
     pub selected_row: usize,
+    pub table_state: TableState,
 
     // Detail view
     pub show_detail: bool,
@@ -459,6 +548,10 @@ pub struct App {
     pub lmstudio_installed: HashSet<String>,
     pub lmstudio_installed_count: usize,
     lmstudio: LmStudioProvider,
+    pub vllm_available: bool,
+    pub vllm_installed: HashSet<String>,
+    pub vllm_installed_count: usize,
+    vllm: VllmProvider,
 
     // Download state
     pub pull_active: Option<PullHandle>,
@@ -562,6 +655,43 @@ pub struct App {
     /// hardware — shown in the system bar so users aren't left wondering
     /// why the list looks shorter than expected.
     pub backend_hidden_count: usize,
+
+    // Benchmarks view (localmaxxing.com)
+    pub show_benchmarks: bool,
+    pub bench_entries: Vec<llmfit_core::benchmarks::LeaderboardEntry>,
+    pub bench_cursor: usize,
+    pub bench_scroll: usize,
+    pub bench_loading: bool,
+    pub bench_error: Option<String>,
+    pub bench_total: u64,
+    pub bench_api_key: Option<String>,
+    /// Label for the currently selected hardware (None = auto-detected).
+    pub bench_hw_label: Option<String>,
+    /// Index into HardwarePreset::all() when the picker is open.
+    pub bench_hw_picker_cursor: usize,
+    pub bench_hw_picker_open: bool,
+
+    // Live inference-bench view (llmfit bench — distinct from community benchmarks above)
+    pub show_bench: bool,
+    pub bench_model_status: Vec<BenchModelStatus>,
+    pub bench_results: Vec<quality::ModelQualityResult>,
+    pub bench_routing: Vec<quality::RoutingRecommendation>,
+    pub bench_runner_ups: Vec<quality::RoutingRecommendation>,
+    pub bench_running: bool,
+    pub bench_progress: String,
+    pub live_bench_scroll: usize,
+    pub bench_selected_row: usize,
+    pub bench_show_detail: bool,
+    pub bench_view_mode: BenchViewMode,
+    pub bench_confirm_quit: bool,
+    pub bench_tests_done: usize,
+    pub bench_tests_total: usize,
+    bench_rx: Option<mpsc::Receiver<BenchMsg>>,
+
+    // Background provider detection
+    provider_detection_rx: mpsc::Receiver<ProviderDetectionMsg>,
+    /// True while background provider detection is still in progress.
+    pub providers_loading: bool,
 }
 
 impl App {
@@ -569,17 +699,7 @@ impl App {
         let real_specs = specs.clone();
         let db = ModelDatabase::new();
 
-        // Detect Ollama
-        let mut ollama = OllamaProvider::new();
-        let (ollama_available, ollama_installed, ollama_installed_count) =
-            ollama.detect_with_installed();
-        let ollama_binary_available = command_exists("ollama");
-
-        // Detect MLX
-        let mlx = MlxProvider::new();
-        let (mlx_available, mlx_installed) = mlx.detect_with_installed();
-
-        // Detect llama.cpp (apply persisted download dir if set)
+        // Detect llama.cpp synchronously (local filesystem check, fast)
         let mut llamacpp = LlamaCppProvider::new();
         if let Some(ref dir) = FilterConfig::load().download_dir {
             let path = std::path::PathBuf::from(dir);
@@ -591,15 +711,92 @@ impl App {
         let llamacpp_detection_hint = llamacpp.detection_hint().to_string();
         let (llamacpp_installed, llamacpp_installed_count) = llamacpp.installed_models_counted();
 
-        // Detect Docker Model Runner
+        // Start with empty provider state — detection runs in background
+        let ollama = OllamaProvider::new();
+        let ollama_available = false;
+        let ollama_binary_available = false;
+        let ollama_installed = HashSet::new();
+        let ollama_installed_count = 0;
+        let mlx = MlxProvider::new();
+        let mlx_available = false;
+        let mlx_installed = HashSet::new();
         let docker_mr = DockerModelRunnerProvider::new();
-        let (docker_mr_available, docker_mr_installed, docker_mr_installed_count) =
-            docker_mr.detect_with_installed();
-
-        // Detect LM Studio
+        let docker_mr_available = false;
+        let docker_mr_installed = HashSet::new();
+        let docker_mr_installed_count = 0;
         let lmstudio = LmStudioProvider::new();
-        let (lmstudio_available, lmstudio_installed, lmstudio_installed_count) =
-            lmstudio.detect_with_installed();
+        let lmstudio_available = false;
+        let lmstudio_installed = HashSet::new();
+        let lmstudio_installed_count = 0;
+        let vllm = VllmProvider::new();
+        let vllm_available = false;
+        let vllm_installed = HashSet::new();
+        let vllm_installed_count = 0;
+
+        // Spawn background provider detection for network-based providers
+        let (provider_tx, provider_detection_rx) = mpsc::channel();
+        {
+            let tx = provider_tx.clone();
+            thread::spawn(move || {
+                let mut ollama = OllamaProvider::new();
+                let (available, installed, installed_count) = ollama.detect_with_installed();
+                let binary_available = command_exists("ollama");
+                let _ = tx.send(ProviderDetectionMsg::Ollama {
+                    available,
+                    binary_available,
+                    installed,
+                    installed_count,
+                    provider: ollama,
+                });
+            });
+        }
+        {
+            let tx = provider_tx.clone();
+            thread::spawn(move || {
+                let mlx = MlxProvider::new();
+                let (available, installed) = mlx.detect_with_installed();
+                let _ = tx.send(ProviderDetectionMsg::Mlx {
+                    available,
+                    installed,
+                });
+            });
+        }
+        {
+            let tx = provider_tx.clone();
+            thread::spawn(move || {
+                let docker_mr = DockerModelRunnerProvider::new();
+                let (available, installed, installed_count) = docker_mr.detect_with_installed();
+                let _ = tx.send(ProviderDetectionMsg::DockerMr {
+                    available,
+                    installed,
+                    installed_count,
+                });
+            });
+        }
+        {
+            let tx = provider_tx.clone();
+            thread::spawn(move || {
+                let lmstudio = LmStudioProvider::new();
+                let (available, installed, installed_count) = lmstudio.detect_with_installed();
+                let _ = tx.send(ProviderDetectionMsg::LmStudio {
+                    available,
+                    installed,
+                    installed_count,
+                });
+            });
+        }
+        {
+            let tx = provider_tx;
+            thread::spawn(move || {
+                let vllm = VllmProvider::new();
+                let (available, installed, installed_count) = vllm.detect_with_installed();
+                let _ = tx.send(ProviderDetectionMsg::Vllm {
+                    available,
+                    installed,
+                    installed_count,
+                });
+            });
+        }
 
         // Track how many we're skipping so the UI can surface it.
         let backend_hidden_count = db
@@ -619,7 +816,8 @@ impl App {
                     || providers::is_model_installed_mlx(&m.name, &mlx_installed)
                     || providers::is_model_installed_llamacpp(&m.name, &llamacpp_installed)
                     || providers::is_model_installed_docker_mr(&m.name, &docker_mr_installed)
-                    || providers::is_model_installed_lmstudio(&m.name, &lmstudio_installed);
+                    || providers::is_model_installed_lmstudio(&m.name, &lmstudio_installed)
+                    || providers::is_model_installed_vllm(&m.name, &vllm_installed);
                 fit
             })
             .collect();
@@ -796,6 +994,7 @@ impl App {
             sort_column,
             sort_ascending,
             selected_row: 0,
+            table_state: TableState::default(),
             show_detail: false,
             show_compare: false,
             compare_mark_model: None,
@@ -839,6 +1038,10 @@ impl App {
             lmstudio_installed,
             lmstudio_installed_count,
             lmstudio,
+            vllm_available,
+            vllm_installed,
+            vllm_installed_count,
+            vllm,
             pull_active: None,
             pull_status: None,
             pull_percent: None,
@@ -908,6 +1111,36 @@ impl App {
             filter_mem_pct_max_input: String::new(),
             filter_sort_ascending: sort_ascending,
             filter_snapshot: None,
+            // Benchmarks
+            show_benchmarks: false,
+            bench_entries: Vec::new(),
+            bench_cursor: 0,
+            bench_scroll: 0,
+            bench_loading: false,
+            bench_error: None,
+            bench_total: 0,
+            bench_api_key: std::env::var("LOCALMAXXING_API_KEY").ok(),
+            bench_hw_label: None,
+            bench_hw_picker_cursor: 0,
+            bench_hw_picker_open: false,
+            // Live inference-bench view
+            show_bench: false,
+            bench_model_status: Vec::new(),
+            bench_results: Vec::new(),
+            bench_routing: Vec::new(),
+            bench_runner_ups: Vec::new(),
+            bench_running: false,
+            bench_progress: String::new(),
+            live_bench_scroll: 0,
+            bench_selected_row: 0,
+            bench_show_detail: false,
+            bench_view_mode: BenchViewMode::Results,
+            bench_confirm_quit: false,
+            bench_tests_done: 0,
+            bench_tests_total: 0,
+            bench_rx: None,
+            provider_detection_rx,
+            providers_loading: true,
         };
 
         // Restore persisted range filters
@@ -1407,6 +1640,7 @@ impl App {
         self.show_compare = false;
         self.show_multi_compare = false;
         self.show_detail = false;
+        self.show_benchmarks = false;
         self.show_downloads = !self.show_downloads;
         if self.show_downloads {
             self.input_mode = InputMode::DownloadManager;
@@ -1517,6 +1751,7 @@ impl App {
         self.show_plan = false;
         self.show_compare = false;
         self.show_downloads = false;
+        self.show_benchmarks = false;
         self.show_detail = !self.show_detail;
     }
 
@@ -1577,6 +1812,7 @@ impl App {
         self.show_detail = false;
         self.show_plan = false;
         self.show_downloads = false;
+        self.show_benchmarks = false;
         self.show_compare = true;
     }
 
@@ -1589,6 +1825,7 @@ impl App {
         self.show_detail = false;
         self.show_compare = false;
         self.show_downloads = false;
+        self.show_benchmarks = false;
         self.show_plan = true;
         self.input_mode = InputMode::Plan;
         self.plan_model_idx = Some(fit_idx);
@@ -1607,6 +1844,165 @@ impl App {
         self.plan_estimate = None;
         self.plan_error = None;
         self.input_mode = InputMode::Normal;
+    }
+
+    // ── Benchmarks view ──────────────────────────────────────────────
+
+    pub fn open_benchmarks(&mut self) {
+        self.show_detail = false;
+        self.show_compare = false;
+        self.show_multi_compare = false;
+        self.show_plan = false;
+        self.show_downloads = false;
+        self.show_benchmarks = true;
+        self.input_mode = InputMode::Benchmarks;
+        self.bench_cursor = 0;
+        self.bench_scroll = 0;
+
+        // Fetch if we don't have data yet
+        if self.bench_entries.is_empty() && !self.bench_loading {
+            self.fetch_benchmarks();
+        }
+    }
+
+    pub fn close_benchmarks(&mut self) {
+        self.show_benchmarks = false;
+        self.input_mode = InputMode::Normal;
+    }
+
+    pub fn fetch_benchmarks(&mut self) {
+        self.bench_loading = true;
+        self.bench_error = None;
+
+        let key = self.bench_api_key.as_deref();
+        match llmfit_core::benchmarks::fetch_leaderboard(&self.specs, key, 100) {
+            Ok(resp) => {
+                self.bench_total = resp.total;
+                self.bench_entries = resp.rows;
+                self.bench_loading = false;
+            }
+            Err(_) => {
+                // API failed — try embedded cache fallback
+                self.bench_loading = false;
+                if let Some(cached) = self.find_cached_for_specs() {
+                    self.bench_total = cached.total;
+                    self.bench_entries = cached.rows;
+                    self.bench_error = Some("Using cached data (API unreachable)".to_string());
+                } else {
+                    self.bench_error =
+                        Some("API unreachable and no cached data for this hardware".to_string());
+                }
+            }
+        }
+    }
+
+    pub fn bench_move_up(&mut self) {
+        if self.bench_cursor > 0 {
+            self.bench_cursor -= 1;
+        }
+    }
+
+    pub fn bench_move_down(&mut self) {
+        if !self.bench_entries.is_empty() && self.bench_cursor < self.bench_entries.len() - 1 {
+            self.bench_cursor += 1;
+        }
+    }
+
+    pub fn bench_refresh(&mut self) {
+        self.bench_entries.clear();
+        self.bench_error = None;
+        self.fetch_benchmarks();
+    }
+
+    /// Try to find cached benchmark data matching the user's detected hardware.
+    fn find_cached_for_specs(&self) -> Option<llmfit_core::benchmarks::LeaderboardResponse> {
+        let gpu_name = self.specs.gpu_name.as_deref().unwrap_or("");
+        let lower = gpu_name.to_lowercase();
+
+        // Try each preset and see if the GPU name matches
+        for preset in llmfit_core::benchmarks::HardwarePreset::all() {
+            if let Some(hw_name) = preset.hardware_name {
+                if lower.contains(&hw_name.to_lowercase()) {
+                    if let Some(cached) =
+                        llmfit_core::benchmarks::cached_leaderboard_for_preset(preset.label)
+                    {
+                        if !cached.rows.is_empty() {
+                            return Some(cached);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn open_bench_hw_picker(&mut self) {
+        self.bench_hw_picker_open = true;
+        self.bench_hw_picker_cursor = 0;
+    }
+
+    pub fn close_bench_hw_picker(&mut self) {
+        self.bench_hw_picker_open = false;
+    }
+
+    pub fn bench_hw_picker_up(&mut self) {
+        if self.bench_hw_picker_cursor > 0 {
+            self.bench_hw_picker_cursor -= 1;
+        }
+    }
+
+    pub fn bench_hw_picker_down(&mut self) {
+        let presets = llmfit_core::benchmarks::HardwarePreset::all();
+        // +1 for the "My Hardware (auto)" entry at position 0
+        let max = presets.len(); // last valid index = presets.len() (0..=presets.len())
+        if self.bench_hw_picker_cursor < max {
+            self.bench_hw_picker_cursor += 1;
+        }
+    }
+
+    pub fn bench_hw_picker_select(&mut self) {
+        let presets = llmfit_core::benchmarks::HardwarePreset::all();
+        self.bench_hw_picker_open = false;
+
+        if self.bench_hw_picker_cursor == 0 {
+            // "My Hardware (auto)" — reset to detected hardware
+            self.bench_hw_label = None;
+            self.bench_entries.clear();
+            self.fetch_benchmarks();
+        } else {
+            let preset = &presets[self.bench_hw_picker_cursor - 1];
+            self.bench_hw_label = Some(preset.label.to_string());
+            self.bench_entries.clear();
+            self.bench_loading = true;
+            self.bench_error = None;
+
+            let key = self.bench_api_key.as_deref();
+            match llmfit_core::benchmarks::fetch_leaderboard_for_preset(preset, key, 100) {
+                Ok(resp) => {
+                    self.bench_total = resp.total;
+                    self.bench_entries = resp.rows;
+                    self.bench_loading = false;
+                }
+                Err(_) => {
+                    // API failed — try embedded cache
+                    self.bench_loading = false;
+                    if let Some(cached) =
+                        llmfit_core::benchmarks::cached_leaderboard_for_preset(preset.label)
+                    {
+                        self.bench_total = cached.total;
+                        self.bench_entries = cached.rows;
+                        self.bench_error = Some("Using cached data (API unreachable)".to_string());
+                    } else {
+                        self.bench_error = Some(
+                            "API unreachable and no cached data for this hardware".to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        self.bench_cursor = 0;
+        self.bench_scroll = 0;
     }
 
     pub fn plan_next_field(&mut self) {
@@ -1941,6 +2337,7 @@ impl App {
         self.show_plan = false;
         self.show_compare = false;
         self.show_downloads = false;
+        self.show_benchmarks = false;
         self.show_multi_compare = true;
     }
 
@@ -2749,10 +3146,11 @@ impl App {
             || self.mlx_available
             || self.llamacpp_available
             || self.docker_mr_available
-            || self.lmstudio_available;
+            || self.lmstudio_available
+            || self.vllm_available;
         if !any_available {
             self.pull_status = Some(
-                "No runtime available — install Ollama, llama.cpp, Docker, or LM Studio"
+                "No runtime available — install Ollama, llama.cpp, Docker, LM Studio, or vLLM"
                     .to_string(),
             );
             return;
@@ -2781,11 +3179,13 @@ impl App {
                 || self.llamacpp_available
                 || self.mlx_available
                 || self.docker_mr_available
-                || self.lmstudio_available;
+                || self.lmstudio_available
+                || self.vllm_available;
             self.pull_status = Some(if any_runtime {
                 Self::format_no_download_message(model_format, is_mlx_model)
             } else {
-                "No runtime available — install Ollama, llama.cpp, Docker, or LM Studio".to_string()
+                "No runtime available — install Ollama, llama.cpp, Docker, LM Studio, or vLLM"
+                    .to_string()
             });
         }
     }
@@ -2842,6 +3242,7 @@ impl App {
             DownloadProvider::LlamaCpp => self.start_llamacpp_download_for_model(model_name),
             DownloadProvider::DockerModelRunner => self.start_docker_mr_download(model_name),
             DownloadProvider::LmStudio => self.start_lmstudio_download(model_name),
+            DownloadProvider::Vllm => self.start_vllm_download(model_name),
         }
     }
 
@@ -2931,13 +3332,31 @@ impl App {
         }
     }
 
+    fn start_vllm_download(&mut self, model_name: String) {
+        let Some(tag) = providers::vllm_pull_tag(&model_name) else {
+            self.pull_status = Some("Not available for vLLM".to_string());
+            return;
+        };
+        match self.vllm.start_pull(&tag) {
+            Ok(handle) => {
+                self.pull_model_name = Some(model_name);
+                self.pull_status = Some(format!("Downloading {} via vLLM...", tag));
+                self.pull_percent = Some(0.0);
+                self.pull_provider = Some(ActivePullProvider::Vllm);
+                self.pull_active = Some(handle);
+            }
+            Err(e) => {
+                self.pull_status = Some(format!("vLLM: {}", e));
+            }
+        }
+    }
+
     /// Poll the active pull for progress. Called each TUI tick.
     pub fn tick_pull(&mut self) {
+        self.tick_provider_detection();
         self.enqueue_capability_probes_for_visible(24);
         self.tick_download_capability();
-        if self.pull_active.is_some() {
-            self.tick_count = self.tick_count.wrapping_add(1);
-        }
+        self.tick_count = self.tick_count.wrapping_add(1);
         let Some(handle) = &self.pull_active else {
             return;
         };
@@ -3028,17 +3447,21 @@ impl App {
             providers_for_model.push(DownloadProvider::Mlx);
         }
         // Check catalog gguf_sources first (no HTTP probe needed), then
-        // fall back to the heuristic repo lookup
-        if self.llamacpp_available
-            && (has_catalog_gguf || providers::first_existing_gguf_repo(model_name).is_some())
-        {
+        // fall back to the heuristic repo lookup. Cache the result so
+        // both llama.cpp and LM Studio can use it without a double probe.
+        let has_gguf =
+            has_catalog_gguf || providers::first_existing_gguf_repo(model_name).is_some();
+        if self.llamacpp_available && has_gguf {
             providers_for_model.push(DownloadProvider::LlamaCpp);
         }
         if self.docker_mr_available && providers::has_docker_mr_mapping(model_name) {
             providers_for_model.push(DownloadProvider::DockerModelRunner);
         }
-        if self.lmstudio_available && providers::has_lmstudio_mapping(model_name) {
+        if self.lmstudio_available && has_gguf {
             providers_for_model.push(DownloadProvider::LmStudio);
+        }
+        if self.vllm_available && providers::has_vllm_mapping(model_name) {
+            providers_for_model.push(DownloadProvider::Vllm);
         }
         providers_for_model
     }
@@ -3107,6 +3530,9 @@ impl App {
         let (lmstudio_set, lmstudio_count) = self.lmstudio.installed_models_counted();
         self.lmstudio_installed = lmstudio_set;
         self.lmstudio_installed_count = lmstudio_count;
+        let (vllm_set, vllm_count) = self.vllm.installed_models_counted();
+        self.vllm_installed = vllm_set;
+        self.vllm_installed_count = vllm_count;
         for fit in &mut self.all_fits {
             fit.installed = providers::is_model_installed(&fit.model.name, &self.ollama_installed)
                 || providers::is_model_installed_mlx(&fit.model.name, &self.mlx_installed)
@@ -3121,7 +3547,8 @@ impl App {
                 || providers::is_model_installed_lmstudio(
                     &fit.model.name,
                     &self.lmstudio_installed,
-                );
+                )
+                || providers::is_model_installed_vllm(&fit.model.name, &self.vllm_installed);
         }
         self.re_sort();
         self.enqueue_capability_probes_for_visible(24);
@@ -3163,6 +3590,7 @@ impl App {
         let llamacpp_available = self.llamacpp_available;
         let docker_mr_available = self.docker_mr_available;
         let lmstudio_available = self.lmstudio_available;
+        let vllm_available = self.vllm_available;
         std::thread::spawn(move || {
             let has_ollama = ollama_runtime_available && providers::has_ollama_mapping(&model_name);
             let has_llamacpp = if llamacpp_available {
@@ -3173,6 +3601,7 @@ impl App {
             };
             let has_docker = docker_mr_available && providers::has_docker_mr_mapping(&model_name);
             let has_lmstudio = lmstudio_available && providers::has_lmstudio_mapping(&model_name);
+            let has_vllm = vllm_available && providers::has_vllm_mapping(&model_name);
 
             let mut flags = 0u8;
             if has_ollama {
@@ -3186,6 +3615,9 @@ impl App {
             }
             if has_lmstudio {
                 flags |= DL_LMSTUDIO;
+            }
+            if has_vllm {
+                flags |= DL_VLLM;
             }
             let _ = tx.send((model_name, DownloadCapability::Known(flags)));
         });
@@ -3204,6 +3636,97 @@ impl App {
         }
     }
 
+    /// Poll background provider detection threads and merge results.
+    fn tick_provider_detection(&mut self) {
+        let mut got_any = false;
+        loop {
+            match self.provider_detection_rx.try_recv() {
+                Ok(msg) => {
+                    got_any = true;
+                    match msg {
+                        ProviderDetectionMsg::Ollama {
+                            available,
+                            binary_available,
+                            installed,
+                            installed_count,
+                            provider,
+                        } => {
+                            self.ollama_available = available;
+                            self.ollama_binary_available = binary_available;
+                            self.ollama_installed = installed;
+                            self.ollama_installed_count = installed_count;
+                            self.ollama = provider;
+                        }
+                        ProviderDetectionMsg::Mlx {
+                            available,
+                            installed,
+                        } => {
+                            self.mlx_available = available;
+                            self.mlx_installed = installed;
+                        }
+                        ProviderDetectionMsg::DockerMr {
+                            available,
+                            installed,
+                            installed_count,
+                        } => {
+                            self.docker_mr_available = available;
+                            self.docker_mr_installed = installed;
+                            self.docker_mr_installed_count = installed_count;
+                        }
+                        ProviderDetectionMsg::LmStudio {
+                            available,
+                            installed,
+                            installed_count,
+                        } => {
+                            self.lmstudio_available = available;
+                            self.lmstudio_installed = installed;
+                            self.lmstudio_installed_count = installed_count;
+                        }
+                        ProviderDetectionMsg::Vllm {
+                            available,
+                            installed,
+                            installed_count,
+                        } => {
+                            self.vllm_available = available;
+                            self.vllm_installed = installed;
+                            self.vllm_installed_count = installed_count;
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.providers_loading = false;
+                    break;
+                }
+            }
+        }
+        if got_any {
+            // Re-mark installed status for all models
+            for fit in &mut self.all_fits {
+                fit.installed =
+                    providers::is_model_installed(&fit.model.name, &self.ollama_installed)
+                        || providers::is_model_installed_mlx(&fit.model.name, &self.mlx_installed)
+                        || providers::is_model_installed_llamacpp(
+                            &fit.model.name,
+                            &self.llamacpp_installed,
+                        )
+                        || providers::is_model_installed_docker_mr(
+                            &fit.model.name,
+                            &self.docker_mr_installed,
+                        )
+                        || providers::is_model_installed_lmstudio(
+                            &fit.model.name,
+                            &self.lmstudio_installed,
+                        )
+                        || providers::is_model_installed_vllm(
+                            &fit.model.name,
+                            &self.vllm_installed,
+                        );
+            }
+            self.re_sort();
+        }
+    }
+
     fn active_plan_input(&self) -> &String {
         match self.plan_field {
             PlanField::Context => &self.plan_context_input,
@@ -3219,6 +3742,369 @@ impl App {
             PlanField::Quant => &mut self.plan_quant_input,
             PlanField::KvQuant => &mut self.plan_kv_quant_input,
             PlanField::TargetTps => &mut self.plan_target_tps_input,
+        }
+    }
+
+    // ── Live inference-bench view ─────────────────────────────────────────
+
+    /// Open the live bench view. Loads cache if available, otherwise starts
+    /// a fresh benchmark run against all installed Ollama models.
+    pub fn open_bench(&mut self) {
+        self.show_bench = true;
+        self.live_bench_scroll = 0;
+        self.bench_view_mode = BenchViewMode::Results;
+
+        if !self.bench_running && self.ollama_available {
+            if !self.load_bench_cache() {
+                self.start_bench();
+            }
+        }
+    }
+
+    /// Force re-run benchmarks (Shift-B keybinding).
+    pub fn rerun_bench(&mut self) {
+        if !self.bench_running && self.ollama_available {
+            self.start_bench();
+        }
+    }
+
+    pub fn close_bench(&mut self) {
+        self.show_bench = false;
+    }
+
+    fn bench_cache_path() -> Option<std::path::PathBuf> {
+        dirs::home_dir().map(|h| h.join(".config").join("llmfit").join("bench-cache.json"))
+    }
+
+    fn save_bench_cache(&self) {
+        let Some(path) = Self::bench_cache_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut installed: Vec<String> = self
+            .ollama_installed
+            .iter()
+            .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
+            .collect();
+        installed.sort();
+        let cache = serde_json::json!({
+            "models_hash": format!("{:?}", installed),
+            "results": self.bench_results,
+            "routing": self.bench_routing,
+            "runner_ups": self.bench_runner_ups,
+        });
+        let _ = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&cache).unwrap_or_default(),
+        );
+    }
+
+    /// Load cached results. Returns `true` if cache was valid and loaded.
+    fn load_bench_cache(&mut self) -> bool {
+        let Some(path) = Self::bench_cache_path() else {
+            return false;
+        };
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        let Ok(cache) = serde_json::from_str::<serde_json::Value>(&data) else {
+            return false;
+        };
+
+        // Check if installed models match
+        let mut installed: Vec<String> = self
+            .ollama_installed
+            .iter()
+            .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
+            .collect();
+        installed.sort();
+        let current_hash = format!("{:?}", installed);
+        let cached_hash = cache
+            .get("models_hash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if current_hash != cached_hash {
+            self.bench_progress = "Models changed — re-running benchmarks...".to_string();
+            return false;
+        }
+
+        if let Some(results) = cache.get("results") {
+            if let Ok(r) =
+                serde_json::from_value::<Vec<quality::ModelQualityResult>>(results.clone())
+            {
+                self.bench_results = r;
+            }
+        }
+        if let Some(routing) = cache.get("routing") {
+            if let Ok(r) =
+                serde_json::from_value::<Vec<quality::RoutingRecommendation>>(routing.clone())
+            {
+                self.bench_routing = r;
+            }
+        }
+        if let Some(ru) = cache.get("runner_ups") {
+            if let Ok(r) = serde_json::from_value::<Vec<quality::RoutingRecommendation>>(ru.clone())
+            {
+                self.bench_runner_ups = r;
+            }
+        }
+
+        // Rebuild model status from cached results
+        let config = quality::default_quality_config();
+        self.bench_model_status = installed
+            .iter()
+            .map(|name| {
+                let is_done = self.bench_results.iter().any(|r| r.model == *name);
+                BenchModelStatus {
+                    name: name.clone(),
+                    state: if is_done {
+                        BenchModelState::Complete
+                    } else {
+                        BenchModelState::Pending
+                    },
+                    roles_done: if is_done { config.roles.len() } else { 0 },
+                    roles_total: config.roles.len(),
+                    current_role: if is_done {
+                        "done".to_string()
+                    } else {
+                        String::new()
+                    },
+                    last_quality: 0.0,
+                    last_speed: 0.0,
+                }
+            })
+            .collect();
+
+        self.bench_progress = "Loaded from cache (Shift-B to re-run)".to_string();
+        self.bench_running = false;
+        true
+    }
+
+    pub fn toggle_bench_view(&mut self) {
+        self.bench_view_mode = match self.bench_view_mode {
+            BenchViewMode::Results => BenchViewMode::Routing,
+            BenchViewMode::Routing => BenchViewMode::Results,
+        };
+        self.live_bench_scroll = 0;
+    }
+
+    fn start_bench(&mut self) {
+        self.bench_running = true;
+        self.bench_confirm_quit = false;
+        self.bench_progress = "Starting benchmarks...".to_string();
+        self.bench_results.clear();
+        self.bench_routing.clear();
+        self.bench_runner_ups.clear();
+        self.bench_tests_done = 0;
+
+        let (tx, rx) = mpsc::channel();
+        self.bench_rx = Some(rx);
+
+        let ollama_url =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+        // Deduplicate: strip ":latest" suffix and remove dupes
+        let mut seen = std::collections::HashSet::new();
+        let mut models: Vec<String> = self
+            .ollama_installed
+            .iter()
+            .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
+            .filter(|m| seen.insert(m.clone()))
+            .collect();
+        models.sort();
+        let config = quality::default_quality_config();
+        let roles_total = config.roles.len();
+
+        // Compute total tests across all models
+        let tests_per_model: usize = config.roles.values().map(|r| r.tests.len()).sum();
+        self.bench_tests_total = tests_per_model * models.len();
+
+        // Build initial status list
+        self.bench_model_status = models
+            .iter()
+            .map(|name| BenchModelStatus {
+                name: name.clone(),
+                state: BenchModelState::Pending,
+                roles_done: 0,
+                roles_total,
+                current_role: String::new(),
+                last_quality: 0.0,
+                last_speed: 0.0,
+            })
+            .collect();
+
+        std::thread::spawn(move || {
+            for model in &models {
+                let _ = tx.send(BenchMsg::ModelStarted(model.clone()));
+
+                let mut all_roles = Vec::new();
+                let mut all_test_results = Vec::new();
+
+                for (role_name, role_def) in &config.roles {
+                    let url = format!("{}/api/generate", ollama_url.trim_end_matches('/'));
+                    let mut role_results = Vec::new();
+
+                    for test_def in &role_def.tests {
+                        let max_tok = test_def.max_tokens.unwrap_or(1024);
+                        let temp = test_def.temperature.unwrap_or(0.3);
+                        let result = match quality::quality_ollama_generate(
+                            &url,
+                            model,
+                            &test_def.prompt,
+                            max_tok,
+                            temp,
+                        ) {
+                            Ok(resp) => {
+                                let q = quality::evaluate_response(&resp.text, &test_def.rules);
+                                let sw = test_def.speed_weight.unwrap_or(1.0);
+                                let sn = (resp.tok_per_sec / 3.0).min(10.0);
+                                let comp = (q * 2.0 + sn * sw) / (2.0 + sw);
+                                quality::QualityResult {
+                                    test_name: test_def.name.clone(),
+                                    role: role_name.clone(),
+                                    quality: q,
+                                    tok_per_sec: resp.tok_per_sec,
+                                    eval_tokens: resp.eval_count,
+                                    wall_time_sec: resp.wall_time_sec,
+                                    ttft_ms: resp.ttft_ms,
+                                    composite: comp,
+                                    response_preview: resp.text.chars().take(150).collect(),
+                                    error: None,
+                                }
+                            }
+                            Err(e) => quality::QualityResult {
+                                test_name: test_def.name.clone(),
+                                role: role_name.clone(),
+                                quality: 0.0,
+                                tok_per_sec: 0.0,
+                                eval_tokens: 0,
+                                wall_time_sec: 0.0,
+                                ttft_ms: None,
+                                composite: 0.0,
+                                response_preview: String::new(),
+                                error: Some(e),
+                            },
+                        };
+                        let _ = tx.send(BenchMsg::TestDone {
+                            model: model.clone(),
+                            role: role_name.clone(),
+                            test_name: test_def.name.clone(),
+                        });
+                        role_results.push(result);
+                    }
+
+                    let n = role_results.len().max(1) as f64;
+                    let avg_q = role_results.iter().map(|r| r.quality).sum::<f64>() / n;
+                    let avg_s = role_results.iter().map(|r| r.tok_per_sec).sum::<f64>() / n;
+                    let avg_c = role_results.iter().map(|r| r.composite).sum::<f64>() / n;
+                    let tests_in_role = role_results.len();
+
+                    let _ = tx.send(BenchMsg::RoleDone {
+                        model: model.clone(),
+                        role: role_name.clone(),
+                        quality: avg_q,
+                        speed: avg_s,
+                        tests_in_role,
+                    });
+
+                    all_test_results.extend(role_results);
+
+                    all_roles.push(quality::RoleScore {
+                        role: role_name.clone(),
+                        quality: (avg_q * 10.0).round() / 10.0,
+                        speed: (avg_s * 10.0).round() / 10.0,
+                        composite: (avg_c * 10.0).round() / 10.0,
+                        test_count: tests_in_role,
+                    });
+                }
+
+                let overall_q = all_roles.iter().map(|r| r.quality).sum::<f64>()
+                    / all_roles.len().max(1) as f64;
+                let overall_s =
+                    all_roles.iter().map(|r| r.speed).sum::<f64>() / all_roles.len().max(1) as f64;
+                let overall_c = all_roles.iter().map(|r| r.composite).sum::<f64>()
+                    / all_roles.len().max(1) as f64;
+
+                let _ = tx.send(BenchMsg::ModelDone(quality::ModelQualityResult {
+                    model: model.clone(),
+                    provider: "ollama".to_string(),
+                    roles: all_roles,
+                    test_results: all_test_results,
+                    overall_quality: (overall_q * 10.0).round() / 10.0,
+                    overall_speed: (overall_s * 10.0).round() / 10.0,
+                    overall_composite: (overall_c * 10.0).round() / 10.0,
+                }));
+            }
+            let _ = tx.send(BenchMsg::AllDone);
+        });
+    }
+
+    pub fn tick_bench(&mut self) {
+        if self.show_bench {
+            self.tick_count = self.tick_count.wrapping_add(1);
+        }
+        if let Some(rx) = &self.bench_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    BenchMsg::Progress(s) => self.bench_progress = s,
+                    BenchMsg::ModelStarted(name) => {
+                        self.bench_progress = format!("Benchmarking {}...", name);
+                        if let Some(ms) =
+                            self.bench_model_status.iter_mut().find(|m| m.name == name)
+                        {
+                            ms.state = BenchModelState::Running;
+                        }
+                    }
+                    BenchMsg::TestDone {
+                        model: _,
+                        role,
+                        test_name,
+                    } => {
+                        self.bench_tests_done += 1;
+                        self.bench_progress = format!(
+                            "{}/{} tests [{} > {}]",
+                            self.bench_tests_done, self.bench_tests_total, role, test_name
+                        );
+                    }
+                    BenchMsg::RoleDone {
+                        model,
+                        role,
+                        quality,
+                        speed,
+                        tests_in_role: _,
+                    } => {
+                        if let Some(ms) =
+                            self.bench_model_status.iter_mut().find(|m| m.name == model)
+                        {
+                            ms.roles_done += 1;
+                            ms.current_role = role;
+                            ms.last_quality = quality;
+                            ms.last_speed = speed;
+                        }
+                    }
+                    BenchMsg::ModelDone(result) => {
+                        self.bench_progress = format!("Completed: {}", result.model);
+                        if let Some(ms) = self
+                            .bench_model_status
+                            .iter_mut()
+                            .find(|m| m.name == result.model)
+                        {
+                            ms.state = BenchModelState::Complete;
+                            ms.current_role = "done".to_string();
+                        }
+                        self.bench_results.push(result);
+                    }
+                    BenchMsg::AllDone => {
+                        self.bench_running = false;
+                        self.bench_progress = "Benchmark complete! (Shift-B to re-run)".to_string();
+                        self.bench_routing = quality::compute_routing(&self.bench_results);
+                        self.bench_runner_ups = quality::compute_runner_ups(&self.bench_results);
+                        self.save_bench_cache();
+                    }
+                }
+            }
         }
     }
 }

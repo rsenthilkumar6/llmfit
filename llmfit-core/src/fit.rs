@@ -110,7 +110,7 @@ impl ScoringWeights {
 pub enum InferenceRuntime {
     LlamaCpp, // llama.cpp / Ollama
     Mlx,      // Apple MLX framework
-    Vllm,     // vLLM (for AWQ/GPTQ pre-quantized models)
+    Vllm,     // vLLM (for AWQ/GPTQ/AutoRound pre-quantized models)
 }
 
 impl InferenceRuntime {
@@ -210,12 +210,13 @@ pub struct ModelFit {
     pub moe_offloaded_gb: Option<f64>, // GB of inactive experts offloaded to RAM
     pub score: f64,                    // weighted composite score 0-100
     pub score_components: ScoreComponents,
-    pub estimated_tps: f64,         // baseline estimated tokens per second
-    pub best_quant: String,         // best quantization for this hardware
-    pub use_case: UseCase,          // inferred use case category
-    pub runtime: InferenceRuntime,  // inference runtime (MLX or llama.cpp)
-    pub installed: bool,            // model found in a local runtime provider
-    pub fits_with_turboquant: bool, // TooTight at fp16 KV but fits with TurboQuant KV
+    pub estimated_tps: f64,            // baseline estimated tokens per second
+    pub best_quant: String,            // best quantization for this hardware
+    pub use_case: UseCase,             // inferred use case category
+    pub runtime: InferenceRuntime,     // inference runtime (MLX or llama.cpp)
+    pub installed: bool,               // model found in a local runtime provider
+    pub fits_with_turboquant: bool,    // TooTight at fp16 KV but fits with TurboQuant KV
+    pub effective_context_length: u32, // context length used for memory estimation
 }
 
 impl ModelFit {
@@ -446,7 +447,7 @@ impl ModelFit {
         };
 
         // Dynamic quantization: find best quant that fits
-        // Pre-quantized models (AWQ/GPTQ) have a fixed quantization — skip dynamic selection.
+        // Pre-quantized models (AWQ/GPTQ/AutoRound) have a fixed quantization — skip dynamic selection.
         let (best_quant, _best_quant_mem) = if model.is_prequantized() {
             (model.quantization.as_str(), mem_required)
         } else {
@@ -550,6 +551,7 @@ impl ModelFit {
             runtime,
             installed: false, // set later by App after provider detection
             fits_with_turboquant,
+            effective_context_length: estimation_ctx,
         }
     }
 
@@ -1080,7 +1082,8 @@ fn estimate_tps(
                     gpu_compute_time,
                     1.0 / total_time
                 );
-                return (1.0 / total_time).max(0.1);
+                let mode_factor = config.run_mode_factors.for_run_mode(run_mode);
+                return ((1.0 / total_time) * mode_factor).max(0.1);
             }
 
             // GPU mode: MoE model fits in VRAM with ALL expert weights loaded.
@@ -1131,8 +1134,21 @@ fn estimate_tps(
                 // Only apply penalty when model actually fits in VRAM (util <= 1.0)
                 // AND utilization is above the threshold. Below it, the model fits
                 // easily with plenty of L2 cache room — no pressure.
-                if !(VRAM_PRESSURE_UTIL_THRESHOLD..=1.0).contains(&util) {
+                if util > 1.0 {
+                    // util > 1.0 means total model size exceeds VRAM, which should not
+                    // happen in GPU mode (the routing logic only sends models that fit).
+                    // Log a warning so this edge case is visible in debug output rather
+                    // than silently returning a no-penalty value that masks the error.
+                    debug_log!(
+                        "VRAM pressure: {} util={:.2} exceeds 1.0 in GPU mode — possible routing error (total={:.1}GB vram={:.1}GB)",
+                        model.name,
+                        util,
+                        total_model_gb,
+                        vram,
+                    );
                     1.0
+                } else if util < VRAM_PRESSURE_UTIL_THRESHOLD {
+                    1.0 // model fits easily, no cache-pressure penalty
                 } else {
                     // Expert density: ratio of inactive to total experts.
                     // More inactive experts = more cache pollution per token.
@@ -1345,6 +1361,9 @@ fn quality_score(model: &LlmModel, quant: &str, use_case: UseCase) -> f64 {
         0.0
     };
 
+    // Generation bonus: newer model generations get a quality bump
+    let gen_bonus = models::generation_quality_bonus(model.architecture.as_deref(), &model.name);
+
     // Quantization penalty
     let q_penalty = models::quant_quality_penalty(quant);
 
@@ -1377,7 +1396,7 @@ fn quality_score(model: &LlmModel, quant: &str, use_case: UseCase) -> f64 {
         _ => 0.0,
     };
 
-    (base + family_bump + q_penalty + task_bump).clamp(0.0, 100.0)
+    (base + family_bump + gen_bonus + q_penalty + task_bump).clamp(0.0, 100.0)
 }
 
 /// Speed score: normalize estimated TPS against target for the use case.
@@ -1480,6 +1499,7 @@ mod tests {
             moe_intermediate_size: None,
             vocab_size: None,
             shared_expert_intermediate_size: None,
+            architecture: None,
         }
     }
 
@@ -1668,6 +1688,7 @@ mod tests {
             moe_intermediate_size: None,
             vocab_size: None,
             shared_expert_intermediate_size: None,
+            architecture: None,
         };
         let mut system = test_system(64.0, true, Some(8.0));
         system.backend = GpuBackend::Cuda;
@@ -1711,6 +1732,7 @@ mod tests {
             moe_intermediate_size: None,
             vocab_size: None,
             shared_expert_intermediate_size: None,
+            architecture: None,
         };
         let system = test_system(12.0, true, Some(8.0));
 
@@ -1890,6 +1912,66 @@ mod tests {
     }
 
     #[test]
+    fn test_quality_score_generation_bonus() {
+        // Qwen3.6-35B (gen 3.6) should score higher than Qwen2-72B (gen 2.0)
+        // despite having fewer parameters
+        let mut qwen36_35b = test_model("35B", 20.0, Some(20.0));
+        qwen36_35b.name = "Qwen/Qwen3.6-35B-A3B".to_string();
+        qwen36_35b.architecture = Some("qwen3_5_moe".to_string());
+
+        let mut qwen2_72b = test_model("72B", 40.0, Some(40.0));
+        qwen2_72b.name = "Qwen/Qwen2.5-72B-Instruct".to_string();
+        qwen2_72b.architecture = Some("qwen2".to_string());
+
+        let score_36 = quality_score(&qwen36_35b, "Q4_K_M", UseCase::General);
+        let score_2 = quality_score(&qwen2_72b, "Q4_K_M", UseCase::General);
+
+        // Qwen3.6 (gen 3.5): base 89 + family 2 + gen_bonus 7.5 = 98.5
+        // Qwen2.5 (gen 2.0): base 95 + family 2 + gen_bonus 3.0 = 100 (clamped)
+        // With quant penalty (-5 each): 93.5 vs 95
+        // The gen bonus narrows the gap significantly (was 89 vs 95 = 6pt gap,
+        // now 93.5 vs 95 = 1.5pt gap)
+        assert!(
+            score_36 > score_2 - 3.0,
+            "Qwen3.6-35B ({}) should be within 3 points of Qwen2-72B ({})",
+            score_36,
+            score_2
+        );
+    }
+
+    #[test]
+    fn test_quality_score_generation_same_size() {
+        // Same parameter count, different generation — newer should score higher
+        let mut qwen3_8b = test_model("8B", 5.0, Some(5.0));
+        qwen3_8b.name = "Qwen/Qwen3-8B".to_string();
+        qwen3_8b.architecture = Some("qwen3".to_string());
+
+        let mut qwen2_7b = test_model("7B", 4.0, Some(4.0));
+        qwen2_7b.name = "Qwen/Qwen2.5-7B-Instruct".to_string();
+        qwen2_7b.architecture = Some("qwen2".to_string());
+
+        let score_3 = quality_score(&qwen3_8b, "Q4_K_M", UseCase::General);
+        let score_2 = quality_score(&qwen2_7b, "Q4_K_M", UseCase::General);
+
+        assert!(
+            score_3 > score_2,
+            "Qwen3-8B ({}) should score higher than Qwen2.5-7B ({})",
+            score_3,
+            score_2
+        );
+    }
+
+    #[test]
+    fn test_quality_score_no_generation_unchanged() {
+        // Models without architecture info should score the same as before
+        let model = test_model("7B", 4.0, Some(4.0));
+        let score = quality_score(&model, "Q4_K_M", UseCase::General);
+
+        // base 75 (7-10B) + family 0 + gen 0 + quant -5 + task 0 = 70
+        assert!((score - 70.0).abs() < 0.01, "Got {}", score);
+    }
+
+    #[test]
     fn test_weighted_score_composition() {
         let components = ScoreComponents {
             quality: 80.0,
@@ -1973,6 +2055,8 @@ mod tests {
         let baseline = ModelFit::analyze(&model, &system);
         let capped = ModelFit::analyze_with_context_limit(&model, &system, Some(4096));
 
+        assert_eq!(baseline.effective_context_length, DEFAULT_ESTIMATION_CTX);
+        assert_eq!(capped.effective_context_length, 4096);
         assert!(capped.memory_required_gb < baseline.memory_required_gb);
         assert!(capped.notes.iter().any(|n| n.contains("Context capped at")));
     }
@@ -2414,6 +2498,7 @@ mod tests {
             moe_intermediate_size: None,
             vocab_size: None,
             shared_expert_intermediate_size: None,
+            architecture: None,
         }
     }
 
@@ -2698,6 +2783,7 @@ mod tests {
             moe_intermediate_size: None,
             vocab_size: None,
             shared_expert_intermediate_size: None,
+            architecture: None,
         }
     }
 
@@ -2984,6 +3070,7 @@ mod tests {
             } else {
                 None
             },
+            architecture: None,
         }
     }
 
