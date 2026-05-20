@@ -10,7 +10,7 @@ source "$HOME/.local/bin/build-engine"
 info "Building $(basename "$(pwd)")"
 
 # 2. Define your specific build steps
-run_step "Updates" "repo --latest"
+# run_step "Updates" "repo --latest"
 run_step "Compilation" "cargo build --release"
 # run_step "Testing" "make test"
 # run_step "Protobufs" "make protos"
