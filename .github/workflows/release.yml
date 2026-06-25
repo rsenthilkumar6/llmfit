@@ -51,6 +51,11 @@ jobs:
             os: ubuntu-latest
             use-cross: true
 
+          # Linux RISCV64 (glibc)
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: true
+
           # macOS Intel (cross-compiled from ARM64 runner)
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -75,7 +80,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -252,6 +257,8 @@ jobs:
 
   publish-python:
     needs: release
+    # Run when release succeeds, even if upstream sign-windows was skipped or failed
+    if: always() && needs.release.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -261,12 +268,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v8.2.0
 
       - name: Build Python wheels
         shell: bash
@@ -278,6 +285,7 @@ jobs:
           TARGETS=(
             "manylinux_2_17_x86_64:x86_64-unknown-linux-gnu:llmfit:tar.gz"
             "manylinux_2_17_aarch64:aarch64-unknown-linux-gnu:llmfit:tar.gz"
+            "manylinux_2_39_riscv64:riscv64gc-unknown-linux-gnu:llmfit:tar.gz"
             "musllinux_1_2_x86_64:x86_64-unknown-linux-musl:llmfit:tar.gz"
             "musllinux_1_2_aarch64:aarch64-unknown-linux-musl:llmfit:tar.gz"
             "macosx_10_12_x86_64:x86_64-apple-darwin:llmfit:tar.gz"
@@ -317,10 +325,11 @@ jobs:
 
   publish-crate:
     needs: release
+    if: always() && needs.release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -346,11 +355,12 @@ jobs:
 
   update-homebrew:
     needs: release
+    if: always() && needs.release.result == 'success'
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout tap
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: AlexsJones/homebrew-llmfit
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}

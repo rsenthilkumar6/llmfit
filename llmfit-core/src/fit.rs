@@ -152,14 +152,14 @@ impl SortColumn {
 
     pub fn next(&self) -> Self {
         match self {
+            SortColumn::Params => SortColumn::Score,
             SortColumn::Score => SortColumn::Tps,
-            SortColumn::Tps => SortColumn::Params,
-            SortColumn::Params => SortColumn::MemPct,
+            SortColumn::Tps => SortColumn::MemPct,
             SortColumn::MemPct => SortColumn::Ctx,
             SortColumn::Ctx => SortColumn::ReleaseDate,
             SortColumn::ReleaseDate => SortColumn::UseCase,
             SortColumn::UseCase => SortColumn::Provider,
-            SortColumn::Provider => SortColumn::Score,
+            SortColumn::Provider => SortColumn::Params,
         }
     }
 }
@@ -591,7 +591,8 @@ impl ModelFit {
 /// Pure memory headroom scoring.
 /// - GPU (including Apple Silicon unified memory): can reach Perfect.
 /// - CpuOffload: caps at Good.
-/// - CpuOnly: caps at Marginal -- CPU-only inference is always a compromise.
+/// - CpuOnly: caps at Good -- no GPU acceleration so never Perfect, but a model
+///   that fits with comfortable headroom is genuinely runnable, not Marginal.
 fn score_fit(
     mem_required: f64,
     mem_available: f64,
@@ -630,8 +631,15 @@ fn score_fit(
             }
         }
         RunMode::CpuOnly => {
-            // CPU-only is always a compromise -- cap at Marginal
-            FitLevel::Marginal
+            // CPU-only never reaches Perfect (that requires a GPU), but a model
+            // that fits with comfortable headroom is genuinely runnable -- cap
+            // at Good rather than hiding every CPU-only model behind Marginal.
+            // (Matches the FitLevel::Good contract: "GPU tight, or CPU comfortable".)
+            if mem_available >= mem_required * 1.2 {
+                FitLevel::Good
+            } else {
+                FitLevel::Marginal
+            }
         }
     }
 }
@@ -1323,18 +1331,27 @@ fn compute_scores(
 fn quality_score(model: &LlmModel, quant: &str, use_case: UseCase) -> f64 {
     let params = model.params_b();
 
-    // Base quality by parameter count
-    let base = if params < 1.0 {
+    // For the base quality tier, MoE models are scored on their *active*
+    // parameters per token rather than the total across all experts. A model
+    // like Qwen3-Coder-Next (80B total / 3B active) infers at a quality closer
+    // to a small dense model, so using the 80B total would inflate its tier.
+    let quality_params = model
+        .active_parameters
+        .map(|a| a as f64 / 1_000_000_000.0)
+        .unwrap_or(params);
+
+    // Base quality by (active) parameter count
+    let base = if quality_params < 1.0 {
         30.0
-    } else if params < 3.0 {
+    } else if quality_params < 3.0 {
         45.0
-    } else if params < 7.0 {
+    } else if quality_params < 7.0 {
         60.0
-    } else if params < 10.0 {
+    } else if quality_params < 10.0 {
         75.0
-    } else if params < 20.0 {
+    } else if quality_params < 20.0 {
         82.0
-    } else if params < 40.0 {
+    } else if quality_params < 40.0 {
         89.0
     } else {
         95.0
@@ -1363,6 +1380,24 @@ fn quality_score(model: &LlmModel, quant: &str, use_case: UseCase) -> f64 {
 
     // Generation bonus: newer model generations get a quality bump
     let gen_bonus = models::generation_quality_bonus(model.architecture.as_deref(), &model.name);
+
+    // Recency bonus: same-size models improve over time, so a freshly released
+    // model edges out an identically-sized older one. Uses the catalog
+    // `release_date` (YYYY-MM-DD); models without a date get no bonus.
+    let recency_bonus = model
+        .release_date
+        .as_deref()
+        .and_then(|d| months_since(d, current_year_month()))
+        .map(|months| {
+            if months < 3 {
+                3.0
+            } else if months < 9 {
+                1.5
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0);
 
     // Quantization penalty
     let q_penalty = models::quant_quality_penalty(quant);
@@ -1396,7 +1431,45 @@ fn quality_score(model: &LlmModel, quant: &str, use_case: UseCase) -> f64 {
         _ => 0.0,
     };
 
-    (base + family_bump + gen_bonus + q_penalty + task_bump).clamp(0.0, 100.0)
+    (base + family_bump + gen_bonus + recency_bonus + q_penalty + task_bump).clamp(0.0, 100.0)
+}
+
+/// Whole months elapsed between a `release_date` (`YYYY-MM-DD`, only the year
+/// and month are read) and `now` as a `(year, month)` pair. Returns `None` if
+/// the date can't be parsed; negative spans (future dates) clamp to 0.
+fn months_since(release_date: &str, now: (i32, u32)) -> Option<u32> {
+    let mut parts = release_date.split('-');
+    let year: i32 = parts.next()?.trim().parse().ok()?;
+    let month: i32 = parts.next()?.trim().parse().ok()?;
+    let (now_year, now_month) = now;
+    let diff = (now_year - year) * 12 + (now_month as i32 - month);
+    Some(diff.max(0) as u32)
+}
+
+/// Current `(year, month)` in UTC, derived from the system clock. Falls back to
+/// the Unix epoch if the clock is before 1970 (which only removes the bonus).
+fn current_year_month() -> (i32, u32) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    civil_from_days((secs / 86_400) as i64)
+}
+
+/// Convert days since 1970-01-01 to `(year, month)` in the proleptic Gregorian
+/// calendar (Howard Hinnant's `civil_from_days`). Exact — no 365-day/30-day
+/// approximations, so the recency bonus doesn't drift across leap years.
+fn civil_from_days(z: i64) -> (i32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year as i32, month as u32)
 }
 
 /// Speed score: normalize estimated TPS against target for the use case.
@@ -1415,19 +1488,15 @@ fn fit_score(required: f64, available: f64) -> f64 {
         return 0.0;
     }
     let ratio = required / available;
-    // Sweet spot: 50-80% utilization scores highest
-    if ratio <= 0.5 {
-        // Under-utilizing: still good but not optimal
-        60.0 + (ratio / 0.5) * 40.0
-    } else if ratio <= 0.8 {
-        100.0
-    } else if ratio <= 0.9 {
-        // Getting tight
-        70.0
-    } else {
-        // Very tight
-        50.0
-    }
+    // Headroom is good: anything that fits with room to spare is a perfect fit,
+    // so the score holds a flat 100 up to a comfortable utilization, then eases
+    // down as memory gets tight via a one-sided Gaussian falloff. This removes
+    // the old step function's 100 -> 70 cliff at 80% (79% scored 100, 81%
+    // scored 70) without penalizing models that leave headroom.
+    const COMFORT: f64 = 0.70;
+    const SIGMA: f64 = 0.20;
+    let z = ((ratio - COMFORT) / SIGMA).max(0.0);
+    (100.0 * (-0.5 * z * z).exp()).clamp(0.0, 100.0)
 }
 
 /// Context score: context window capability vs target for the use case.
@@ -1563,10 +1632,26 @@ mod tests {
     }
 
     #[test]
-    fn test_score_fit_cpu_caps_at_marginal() {
-        // CPU-only never reaches Perfect
+    fn test_score_fit_cpu_comfortable_is_good() {
+        // CPU-only with comfortable headroom (4 GB of 32 GB) is runnable -> Good.
+        // It never reaches Perfect (recommended 8 GB is met, but Perfect needs a GPU).
         let fit = score_fit(4.0, 32.0, 8.0, RunMode::CpuOnly);
+        assert_eq!(fit, FitLevel::Good);
+    }
+
+    #[test]
+    fn test_score_fit_cpu_tight_is_marginal() {
+        // CPU-only that only just fits (under the 1.2x headroom bar) stays Marginal.
+        let fit = score_fit(8.0, 8.5, 16.0, RunMode::CpuOnly);
         assert_eq!(fit, FitLevel::Marginal);
+    }
+
+    #[test]
+    fn test_score_fit_cpu_never_perfect() {
+        // Even with enormous headroom, CPU-only caps at Good (no GPU -> not Perfect).
+        let fit = score_fit(1.0, 64.0, 2.0, RunMode::CpuOnly);
+        assert_ne!(fit, FitLevel::Perfect);
+        assert_eq!(fit, FitLevel::Good);
     }
 
     #[test]
@@ -1613,8 +1698,10 @@ mod tests {
 
         // Should use CPU path
         assert_eq!(fit.run_mode, RunMode::CpuOnly);
-        // CPU-only caps at Marginal
-        assert_eq!(fit.fit_level, FitLevel::Marginal);
+        // CPU-only with comfortable headroom (7B in 16 GB) is runnable -> Good,
+        // and never Perfect (that requires a GPU).
+        assert_eq!(fit.fit_level, FitLevel::Good);
+        assert_ne!(fit.fit_level, FitLevel::Perfect);
     }
 
     #[test]
@@ -1824,28 +1911,43 @@ mod tests {
 
     #[test]
     fn test_fit_score_sweet_spot() {
-        // Sweet spot: 50-80% utilization
-        let score = fit_score(6.0, 10.0);
-        assert!(score >= 95.0); // Should be near perfect
+        // Comfortable utilization (room to spare) is a perfect fit.
+        assert!((fit_score(6.5, 10.0) - 100.0).abs() < 0.01); // 65%
+        assert!((fit_score(6.0, 10.0) - 100.0).abs() < 0.01); // 60%
 
-        let score2 = fit_score(8.0, 10.0);
-        assert_eq!(score2, 100.0);
+        // Past the comfort point the smooth curve eases down instead of holding
+        // a flat 100 right up to the old 80% cliff.
+        let score2 = fit_score(8.0, 10.0); // 80%
+        assert!(score2 > 70.0 && score2 < 100.0);
     }
 
     #[test]
     fn test_fit_score_under_utilized() {
-        // Under-utilizing: still good but not optimal
-        let score = fit_score(2.0, 10.0);
-        assert!(score >= 60.0);
-        assert!(score < 100.0);
+        // Plenty of headroom is a good thing, not waste -- it stays a perfect
+        // fit rather than being penalized.
+        assert!((fit_score(2.0, 10.0) - 100.0).abs() < 0.01); // 20%
+        assert!((fit_score(5.0, 10.0) - 100.0).abs() < 0.01); // 50%
     }
 
     #[test]
     fn test_fit_score_tight() {
-        // Very tight fit
-        let score = fit_score(9.5, 10.0);
-        assert!(score >= 50.0);
-        assert!(score < 80.0);
+        // Very tight fit: still positive but well off the peak, and no longer
+        // pinned to the old flat 50 floor.
+        let score = fit_score(9.5, 10.0); // 95% utilization
+        assert!(score > 0.0 && score < 50.0);
+        // Smoothly monotonic as it tightens past the peak.
+        assert!(score < fit_score(8.5, 10.0));
+    }
+
+    #[test]
+    fn test_fit_score_smooth_no_cliffs() {
+        // Across the old 80% step boundary, neighbouring ratios stay close
+        // together instead of jumping 100 -> 70.
+        // Old step: 79% -> 100, 81% -> 70 (a 30-point cliff). The smooth curve
+        // keeps neighbours within a few points of each other.
+        let below = fit_score(7.9, 10.0);
+        let above = fit_score(8.1, 10.0);
+        assert!((below - above).abs() < 8.0);
     }
 
     #[test]
@@ -1969,6 +2071,77 @@ mod tests {
 
         // base 75 (7-10B) + family 0 + gen 0 + quant -5 + task 0 = 70
         assert!((score - 70.0).abs() < 0.01, "Got {}", score);
+    }
+
+    #[test]
+    fn test_quality_score_moe_uses_active_params() {
+        // 80B total / 3B active MoE: the base tier should follow the 3B active
+        // count (45 tier), not the 80B total (95 tier).
+        let mut moe = test_model("80B", 48.0, Some(48.0));
+        moe.active_parameters = Some(3_000_000_000);
+        let moe_score = quality_score(&moe, "Q4_K_M", UseCase::General);
+
+        // A plain 80B dense model (no active_parameters) keeps the top tier.
+        let dense = test_model("80B", 48.0, Some(48.0));
+        let dense_score = quality_score(&dense, "Q4_K_M", UseCase::General);
+
+        assert!(
+            dense_score > moe_score + 30.0,
+            "MoE (active 3B) {} should be far below dense 80B {}",
+            moe_score,
+            dense_score
+        );
+
+        // And it should land near a real 3B dense model's tier.
+        let small = test_model("3B", 2.0, Some(2.0));
+        let small_score = quality_score(&small, "Q4_K_M", UseCase::General);
+        assert!(
+            (moe_score - small_score).abs() < 0.01,
+            "MoE active-3B {} should match dense 3B {}",
+            moe_score,
+            small_score
+        );
+    }
+
+    #[test]
+    fn test_quality_score_recency_bonus() {
+        // Two otherwise-identical models; the newer one scores higher purely on
+        // its release date. months_since/current_year_month back the bonus, so
+        // we exercise the pure helper directly for determinism below.
+        let mut fresh = test_model("7B", 4.0, Some(4.0));
+        fresh.release_date = Some("2099-01-01".to_string()); // far future -> 0 months
+        let mut old = test_model("7B", 4.0, Some(4.0));
+        old.release_date = Some("2000-01-01".to_string()); // ancient -> no bonus
+
+        let fresh_score = quality_score(&fresh, "Q4_K_M", UseCase::General);
+        let old_score = quality_score(&old, "Q4_K_M", UseCase::General);
+        assert!(
+            fresh_score > old_score,
+            "fresh {} should beat old {}",
+            fresh_score,
+            old_score
+        );
+        // Fresh gets the full +3 on top of the no-bonus baseline of 70.
+        assert!((fresh_score - 73.0).abs() < 0.01, "Got {}", fresh_score);
+        assert!((old_score - 70.0).abs() < 0.01, "Got {}", old_score);
+    }
+
+    #[test]
+    fn test_months_since_is_deterministic() {
+        // Pure date math — no dependency on the system clock.
+        assert_eq!(months_since("2026-06-01", (2026, 6)), Some(0));
+        assert_eq!(months_since("2026-04-01", (2026, 6)), Some(2)); // < 3 -> +3
+        assert_eq!(months_since("2025-12-01", (2026, 6)), Some(6)); // < 9 -> +1.5
+        assert_eq!(months_since("2024-06-01", (2026, 6)), Some(24)); // old -> 0
+        assert_eq!(months_since("2099-01-01", (2026, 6)), Some(0)); // future clamps
+        assert_eq!(months_since("not-a-date", (2026, 6)), None);
+    }
+
+    #[test]
+    fn test_civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1)); // epoch
+        assert_eq!(civil_from_days(59), (1970, 3)); // 1970-03-01
+        assert_eq!(civil_from_days(20_454), (2026, 1)); // 2026-01-01
     }
 
     #[test]

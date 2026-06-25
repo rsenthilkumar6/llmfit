@@ -103,12 +103,23 @@ struct HfApiModel {
     safetensors: Option<SafetensorsInfo>,
     #[serde(default)]
     license: Option<String>,
+    /// GGUF metadata (parameter count, context length) for GGUF-only repos.
+    #[serde(default)]
+    gguf: Option<GgufInfo>,
 }
 
 #[derive(Deserialize, Debug, Default)]
 struct SafetensorsInfo {
     #[serde(default)]
     total: Option<u64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct GgufInfo {
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    context_length: Option<u32>,
 }
 
 // ── Parameter extraction ──────────────────────────────────────────────────────
@@ -383,7 +394,7 @@ fn resolve_head_dim(cfg: &HfConfig) -> Option<u32> {
 
 fn hf_get_list(sort: &str, limit: usize, token: Option<&str>) -> Result<Vec<HfApiModel>, String> {
     let url = format!(
-        "{}?pipeline_tag=text-generation&sort={}&limit={}",
+        "{}?pipeline_tag=text-generation&sort={}&limit={}&expand[]=gguf",
         HF_API, sort, limit
     );
     let resp = if let Some(t) = token {
@@ -428,18 +439,32 @@ fn hf_get_list(sort: &str, limit: usize, token: Option<&str>) -> Result<Vec<HfAp
 /// (`num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`,
 /// `head_dim`). The fetch is best-effort and silently degrades to `None`.
 fn map_to_llm_model(hf: HfApiModel, token: Option<&str>) -> Option<LlmModel> {
-    let is_tg = hf.pipeline_tag.as_deref() == Some("text-generation")
-        || hf.tags.iter().any(|t| t == "text-generation");
+    let accepted_pipelines = ["text-generation", "image-text-to-text", "any-to-any"];
+    let is_tg = hf
+        .pipeline_tag
+        .as_deref()
+        .is_some_and(|p| accepted_pipelines.contains(&p))
+        || hf
+            .tags
+            .iter()
+            .any(|t| accepted_pipelines.contains(&t.as_str()));
     if !is_tg {
         return None;
     }
 
-    // Use safetensors for an exact parameter count when available, but always
-    // run name-based parsing for MoE architecture hints — safetensors only
-    // reports total parameters and would cause MoE models (e.g. Mixtral) to
-    // lose their MoE classification and receive inaccurate VRAM estimates.
+    // Use safetensors or GGUF metadata for an exact parameter count when
+    // available, but always run name-based parsing for MoE architecture
+    // hints — safetensors/GGUF only report total parameters and would cause
+    // MoE models (e.g. Mixtral, DeepSeek) to lose their MoE classification
+    // and receive inaccurate VRAM estimates.
+    let exact_total = hf
+        .safetensors
+        .as_ref()
+        .and_then(|s| s.total)
+        .or_else(|| hf.gguf.as_ref().and_then(|g| g.total));
+
     let (param_str, params_raw, is_moe, num_experts, active_experts, active_params) =
-        if let Some(total) = hf.safetensors.as_ref().and_then(|s| s.total) {
+        if let Some(total) = exact_total {
             let (_, _, is_moe, num_experts, active_experts, active_params) =
                 extract_model_params(&hf.id);
             let b = total / 1_000_000_000;
@@ -467,7 +492,12 @@ fn map_to_llm_model(hf: HfApiModel, token: Option<&str>) -> Option<LlmModel> {
 
     let raw = params_raw.unwrap_or(7_000_000_000);
     let use_case = infer_use_case(&hf.id, &hf.tags);
-    let context_length = infer_context_length(&hf.id, params_raw);
+    // Prefer GGUF-reported context length (authoritative), fall back to heuristic.
+    let context_length = hf
+        .gguf
+        .as_ref()
+        .and_then(|g| g.context_length)
+        .unwrap_or_else(|| infer_context_length(&hf.id, params_raw));
     let (min_ram, rec_ram, min_vram) = estimate_ram(raw, is_moe, active_params);
 
     let provider = hf

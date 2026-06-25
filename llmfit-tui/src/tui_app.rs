@@ -9,14 +9,68 @@ use llmfit_core::providers::{
 use llmfit_core::quality;
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Add;
 use std::sync::mpsc;
-use std::thread;
+use std::{cmp, thread};
 
 use ratatui::widgets::TableState;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::download_history::{DownloadHistory, DownloadRecord, DownloadResult};
 use crate::filter_config::FilterConfig;
 use crate::theme::Theme;
+
+fn floor_char_boundary(value: &str, index: usize) -> usize {
+    let mut index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn previous_grapheme_boundary(value: &str, index: usize) -> usize {
+    let index = floor_char_boundary(value, index);
+    value[..index]
+        .grapheme_indices(true)
+        .next_back()
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
+fn next_grapheme_boundary(value: &str, index: usize) -> usize {
+    let index = floor_char_boundary(value, index);
+    value[index..]
+        .grapheme_indices(true)
+        .nth(1)
+        .map(|(idx, _)| index + idx)
+        .unwrap_or_else(|| value.len())
+}
+
+fn insert_ascii_graphic_input(value: &mut String, cursor: &mut usize, c: char) {
+    if !c.is_ascii_graphic() {
+        return;
+    }
+
+    *cursor = floor_char_boundary(value, *cursor);
+    value.insert(*cursor, c);
+    *cursor += c.len_utf8();
+}
+
+fn backspace_grapheme_input(value: &mut String, cursor: &mut usize) {
+    if *cursor > 0 {
+        let prev = previous_grapheme_boundary(value, *cursor);
+        value.drain(prev..*cursor);
+        *cursor = prev;
+    }
+}
+
+fn delete_grapheme_input(value: &mut String, cursor: usize) {
+    if cursor < value.len() {
+        let cursor = floor_char_boundary(value, cursor);
+        let next = next_grapheme_boundary(value, cursor);
+        value.drain(cursor..next);
+    }
+}
 
 /// Messages sent from background provider-detection threads back to the main TUI.
 pub enum ProviderDetectionMsg {
@@ -471,6 +525,26 @@ fn sort_column_from_label(s: &str) -> SortColumn {
     }
 }
 
+/// Case-insensitive subsequence ("fuzzy") match: returns true when every
+/// character of `query` appears in `candidate` in order (not necessarily
+/// contiguous). An empty query matches everything.
+fn fuzzy_match(query: &str, candidate: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let mut q = query.chars().flat_map(char::to_lowercase).peekable();
+    for c in candidate.chars().flat_map(char::to_lowercase) {
+        if let Some(&qc) = q.peek() {
+            if c == qc {
+                q.next();
+            }
+        } else {
+            break;
+        }
+    }
+    q.peek().is_none()
+}
+
 pub struct App {
     pub should_quit: bool,
     pub input_mode: InputMode,
@@ -520,6 +594,8 @@ pub struct App {
 
     // Provider popup
     pub provider_cursor: usize,
+    pub provider_search: String,
+    pub provider_search_cursor_position: usize,
     pub use_case_cursor: usize,
     pub capability_cursor: usize,
     pub download_provider_cursor: usize,
@@ -529,28 +605,18 @@ pub struct App {
     // Provider state
     pub ollama_available: bool,
     pub ollama_binary_available: bool,
-    pub ollama_installed: HashSet<String>,
-    pub ollama_installed_count: usize,
+    pub installed: llmfit_core::analysis::InstalledIndex,
     ollama: OllamaProvider,
     pub mlx_available: bool,
-    pub mlx_installed: HashSet<String>,
     mlx: MlxProvider,
     pub llamacpp_available: bool,
-    pub llamacpp_installed: HashSet<String>,
-    pub llamacpp_installed_count: usize,
     pub llamacpp_detection_hint: String,
     llamacpp: LlamaCppProvider,
     pub docker_mr_available: bool,
-    pub docker_mr_installed: HashSet<String>,
-    pub docker_mr_installed_count: usize,
     docker_mr: DockerModelRunnerProvider,
     pub lmstudio_available: bool,
-    pub lmstudio_installed: HashSet<String>,
-    pub lmstudio_installed_count: usize,
     lmstudio: LmStudioProvider,
     pub vllm_available: bool,
-    pub vllm_installed: HashSet<String>,
-    pub vllm_installed_count: usize,
     vllm: VllmProvider,
 
     // Download state
@@ -715,23 +781,17 @@ impl App {
         let ollama = OllamaProvider::new();
         let ollama_available = false;
         let ollama_binary_available = false;
-        let ollama_installed = HashSet::new();
-        let ollama_installed_count = 0;
         let mlx = MlxProvider::new();
         let mlx_available = false;
-        let mlx_installed = HashSet::new();
         let docker_mr = DockerModelRunnerProvider::new();
         let docker_mr_available = false;
-        let docker_mr_installed = HashSet::new();
-        let docker_mr_installed_count = 0;
         let lmstudio = LmStudioProvider::new();
         let lmstudio_available = false;
-        let lmstudio_installed = HashSet::new();
-        let lmstudio_installed_count = 0;
         let vllm = VllmProvider::new();
         let vllm_available = false;
-        let vllm_installed = HashSet::new();
-        let vllm_installed_count = 0;
+        let mut installed = llmfit_core::analysis::InstalledIndex::empty();
+        installed.llamacpp = llamacpp_installed;
+        installed.llamacpp_count = llamacpp_installed_count;
 
         // Spawn background provider detection for network-based providers
         let (provider_tx, provider_detection_rx) = mpsc::channel();
@@ -812,12 +872,7 @@ impl App {
             .filter(|m| backend_compatible(m, &specs))
             .map(|m| {
                 let mut fit = ModelFit::analyze_with_context_limit(m, &specs, context_limit);
-                fit.installed = providers::is_model_installed(&m.name, &ollama_installed)
-                    || providers::is_model_installed_mlx(&m.name, &mlx_installed)
-                    || providers::is_model_installed_llamacpp(&m.name, &llamacpp_installed)
-                    || providers::is_model_installed_docker_mr(&m.name, &docker_mr_installed)
-                    || providers::is_model_installed_lmstudio(&m.name, &lmstudio_installed)
-                    || providers::is_model_installed_vllm(&m.name, &vllm_installed);
+                fit.installed = installed.is_installed(&m.name);
                 fit
             })
             .collect();
@@ -825,10 +880,16 @@ impl App {
         // Sort by fit level then RAM usage
         all_fits = llmfit_core::fit::rank_models_by_fit(all_fits);
 
-        // Extract unique providers
+        // Extract unique providers (including GGUF source providers)
         let mut model_providers: Vec<String> = all_fits
             .iter()
-            .map(|f| f.model.provider.clone())
+            .flat_map(|f| {
+                let mut providers = vec![f.model.provider.clone()];
+                for gs in &f.model.gguf_sources {
+                    providers.push(gs.provider.clone());
+                }
+                providers
+            })
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -1012,6 +1073,8 @@ impl App {
             plan_estimate: None,
             plan_error: None,
             provider_cursor: 0,
+            provider_search: String::new(),
+            provider_search_cursor_position: 0,
             use_case_cursor: 0,
             capability_cursor: 0,
             download_provider_cursor: 0,
@@ -1019,28 +1082,18 @@ impl App {
             download_provider_model: None,
             ollama_available,
             ollama_binary_available,
-            ollama_installed,
-            ollama_installed_count,
+            installed,
             ollama,
             mlx_available,
-            mlx_installed,
             mlx,
             llamacpp_available,
-            llamacpp_installed,
-            llamacpp_installed_count,
             llamacpp_detection_hint,
             llamacpp,
             docker_mr_available,
-            docker_mr_installed,
-            docker_mr_installed_count,
             docker_mr,
             lmstudio_available,
-            lmstudio_installed,
-            lmstudio_installed_count,
             lmstudio,
             vllm_available,
-            vllm_installed,
-            vllm_installed_count,
             vllm,
             pull_active: None,
             pull_status: None,
@@ -1160,8 +1213,35 @@ impl App {
 
         app.apply_filters();
         app.re_sort();
+        app.preselect_initial_best_fit();
         app.enqueue_capability_probes_for_visible(24);
         app
+    }
+
+    fn preselect_initial_best_fit(&mut self) {
+        self.selected_row = Self::initial_best_fit_row(&self.filtered_fits, &self.all_fits);
+        self.table_state.select(if self.filtered_fits.is_empty() {
+            None
+        } else {
+            Some(self.selected_row)
+        });
+    }
+
+    fn initial_best_fit_row(filtered_fits: &[usize], all_fits: &[ModelFit]) -> usize {
+        filtered_fits
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &fit_idx)| {
+                let fit = all_fits.get(fit_idx)?;
+                matches!(fit.fit_level, FitLevel::Perfect | FitLevel::Good).then_some((row, fit))
+            })
+            .max_by(|(_, a), (_, b)| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(row, _)| row)
+            .unwrap_or(0)
     }
 
     /// Persist the current filter state to disk.
@@ -1268,25 +1348,47 @@ impl App {
                         .join(" ");
                     // Combine all searchable fields into one string
                     let license_text = fit.model.license.as_deref().unwrap_or("").to_lowercase();
+                    let gguf_text = fit
+                        .model
+                        .gguf_sources
+                        .iter()
+                        .map(|gs| {
+                            format!("{} {}", gs.repo.to_lowercase(), gs.provider.to_lowercase())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     let searchable = format!(
-                        "{} {} {} {} {} {} {}",
+                        "{} {} {} {} {} {} {} {}",
                         fit.model.name.to_lowercase(),
                         fit.model.provider.to_lowercase(),
                         fit.model.parameter_count.to_lowercase(),
                         fit.model.use_case.to_lowercase(),
                         fit.use_case.label().to_lowercase(),
                         caps_text,
-                        license_text
+                        license_text,
+                        gguf_text
                     );
                     // All terms must be present (AND logic)
                     terms.iter().all(|term| searchable.contains(term))
                 };
 
-                // Provider filter
-                let provider_idx = self.providers.iter().position(|p| p == &fit.model.provider);
-                let matches_provider = provider_idx
-                    .map(|idx| self.selected_providers[idx])
-                    .unwrap_or(true);
+                // Provider filter (check primary provider and GGUF source providers)
+                let matches_provider = {
+                    let primary_match = self
+                        .providers
+                        .iter()
+                        .position(|p| p == &fit.model.provider)
+                        .map(|idx| self.selected_providers[idx])
+                        .unwrap_or(false);
+                    let gguf_match = fit.model.gguf_sources.iter().any(|gs| {
+                        self.providers
+                            .iter()
+                            .position(|p| p == &gs.provider)
+                            .map(|idx| self.selected_providers[idx])
+                            .unwrap_or(false)
+                    });
+                    primary_match || gguf_match
+                };
                 let use_case_idx = self.use_cases.iter().position(|uc| *uc == fit.use_case);
                 let matches_use_case = use_case_idx
                     .map(|idx| self.selected_use_cases[idx])
@@ -1610,22 +1712,37 @@ impl App {
 
     pub fn search_input(&mut self, c: char) {
         self.search_query.insert(self.cursor_position, c);
-        self.cursor_position += 1;
+        self.cursor_position += c.len_utf8();
         self.apply_filters();
     }
 
     pub fn search_backspace(&mut self) {
         if self.cursor_position > 0 {
-            self.cursor_position -= 1;
-            self.search_query.remove(self.cursor_position);
+            let prev = previous_grapheme_boundary(&self.search_query, self.cursor_position);
+            self.search_query.drain(prev..self.cursor_position);
+            self.cursor_position = prev;
             self.apply_filters();
         }
     }
 
     pub fn search_delete(&mut self) {
         if self.cursor_position < self.search_query.len() {
-            self.search_query.remove(self.cursor_position);
+            let next = next_grapheme_boundary(&self.search_query, self.cursor_position);
+            self.search_query.drain(self.cursor_position..next);
             self.apply_filters();
+        }
+    }
+
+    pub fn search_cursor_left(&mut self) {
+        if self.cursor_position > 0 {
+            self.cursor_position =
+                previous_grapheme_boundary(&self.search_query, self.cursor_position);
+        }
+    }
+
+    pub fn search_cursor_right(&mut self) {
+        if self.cursor_position < self.search_query.len() {
+            self.cursor_position = next_grapheme_boundary(&self.search_query, self.cursor_position);
         }
     }
 
@@ -1667,6 +1784,47 @@ impl App {
         self.dm_dir_input = self.llamacpp.models_dir().display().to_string();
         self.dm_dir_cursor = self.dm_dir_input.len();
         self.dm_editing_dir = true;
+    }
+
+    pub fn insert_dm_dir_char(&mut self, c: char) {
+        self.dm_dir_cursor = floor_char_boundary(&self.dm_dir_input, self.dm_dir_cursor);
+        self.dm_dir_input.insert(self.dm_dir_cursor, c);
+        self.dm_dir_cursor += c.len_utf8();
+    }
+
+    pub fn dm_dir_backspace(&mut self) {
+        self.dm_dir_cursor = floor_char_boundary(&self.dm_dir_input, self.dm_dir_cursor);
+        if self.dm_dir_cursor > 0 {
+            let prev = previous_grapheme_boundary(&self.dm_dir_input, self.dm_dir_cursor);
+            self.dm_dir_input.drain(prev..self.dm_dir_cursor);
+            self.dm_dir_cursor = prev;
+        }
+    }
+
+    pub fn dm_dir_delete(&mut self) {
+        self.dm_dir_cursor = floor_char_boundary(&self.dm_dir_input, self.dm_dir_cursor);
+        if self.dm_dir_cursor < self.dm_dir_input.len() {
+            let next = next_grapheme_boundary(&self.dm_dir_input, self.dm_dir_cursor);
+            self.dm_dir_input.drain(self.dm_dir_cursor..next);
+        }
+    }
+
+    pub fn dm_dir_cursor_left(&mut self) {
+        if self.dm_dir_cursor > 0 {
+            self.dm_dir_cursor = previous_grapheme_boundary(&self.dm_dir_input, self.dm_dir_cursor);
+        }
+    }
+
+    pub fn dm_dir_cursor_right(&mut self) {
+        self.dm_dir_cursor = floor_char_boundary(&self.dm_dir_input, self.dm_dir_cursor);
+        if self.dm_dir_cursor < self.dm_dir_input.len() {
+            self.dm_dir_cursor = next_grapheme_boundary(&self.dm_dir_input, self.dm_dir_cursor);
+        }
+    }
+
+    pub fn dm_dir_clear(&mut self) {
+        self.dm_dir_input.clear();
+        self.dm_dir_cursor = 0;
     }
 
     pub fn apply_download_dir(&mut self) {
@@ -2173,11 +2331,90 @@ impl App {
 
     pub fn open_provider_popup(&mut self) {
         self.input_mode = InputMode::ProviderPopup;
-        // Don't reset cursor -- keep it where it was last time
+        self.provider_search.clear();
+        self.provider_search_cursor_position = 0;
+        self.provider_cursor = 0;
     }
 
     pub fn close_provider_popup(&mut self) {
         self.input_mode = InputMode::Normal;
+        self.provider_search.clear();
+        self.provider_search_cursor_position = 0;
+    }
+
+    /// Indices into `self.providers` that match the current fuzzy search query,
+    /// in display order. With an empty query this is every provider.
+    pub fn provider_filtered_indices(&self) -> Vec<usize> {
+        self.providers
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| fuzzy_match(&self.provider_search, name))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn provider_search_input(&mut self, c: char) {
+        insert_ascii_graphic_input(
+            &mut self.provider_search,
+            &mut self.provider_search_cursor_position,
+            c,
+        );
+        self.clamp_provider_cursor();
+    }
+
+    pub fn provider_search_backspace(&mut self) {
+        backspace_grapheme_input(
+            &mut self.provider_search,
+            &mut self.provider_search_cursor_position,
+        );
+        self.clamp_provider_cursor();
+    }
+
+    pub fn provider_search_delete(&mut self) {
+        delete_grapheme_input(
+            &mut self.provider_search,
+            self.provider_search_cursor_position,
+        );
+        self.clamp_provider_cursor();
+    }
+
+    pub fn provider_search_cursor_left(&mut self) {
+        if self.provider_search_cursor_position > 0 {
+            self.provider_search_cursor_position = previous_grapheme_boundary(
+                &self.provider_search,
+                self.provider_search_cursor_position,
+            );
+        }
+    }
+
+    pub fn provider_search_cursor_right(&mut self) {
+        if self.provider_search_cursor_position < self.provider_search.len() {
+            self.provider_search_cursor_position =
+                next_grapheme_boundary(&self.provider_search, self.provider_search_cursor_position);
+        }
+    }
+
+    pub fn provider_search_cursor_home(&mut self) {
+        self.provider_search_cursor_position = 0;
+    }
+
+    pub fn provider_search_cursor_end(&mut self) {
+        self.provider_search_cursor_position = self.provider_search.len();
+    }
+
+    pub fn provider_search_clear(&mut self) {
+        self.provider_search.clear();
+        self.provider_search_cursor_position = 0;
+        self.clamp_provider_cursor();
+    }
+
+    fn clamp_provider_cursor(&mut self) {
+        let len = self.provider_filtered_indices().len();
+        if len == 0 {
+            self.provider_cursor = 0;
+        } else if self.provider_cursor >= len {
+            self.provider_cursor = len - 1;
+        }
     }
 
     pub fn open_use_case_popup(&mut self) {
@@ -2189,38 +2426,45 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
-    pub fn provider_popup_up(&mut self) {
+    pub fn provider_popup_up(&mut self, step: usize) {
         if self.provider_cursor > 0 {
-            self.provider_cursor -= 1;
+            self.provider_cursor = self.provider_cursor.saturating_sub(step);
         }
     }
 
-    pub fn provider_popup_down(&mut self) {
-        if self.provider_cursor + 1 < self.providers.len() {
-            self.provider_cursor += 1;
+    pub fn provider_popup_down(&mut self, step: usize) {
+        let len = self.provider_filtered_indices().len();
+        if self.provider_cursor + 1 < len {
+            self.provider_cursor = cmp::min(len - 1, self.provider_cursor + step);
         }
     }
 
     pub fn provider_popup_toggle(&mut self) {
-        if self.provider_cursor < self.selected_providers.len() {
-            self.selected_providers[self.provider_cursor] =
-                !self.selected_providers[self.provider_cursor];
+        let filtered = self.provider_filtered_indices();
+        if let Some(&idx) = filtered.get(self.provider_cursor) {
+            self.selected_providers[idx] = !self.selected_providers[idx];
             self.apply_filters();
         }
     }
 
+    /// Toggle all currently-visible (matching) providers. If they are all
+    /// selected, deselect them; otherwise select them all.
     pub fn provider_popup_select_all(&mut self) {
-        let all_selected = self.selected_providers.iter().all(|&s| s);
+        let filtered = self.provider_filtered_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let all_selected = filtered.iter().all(|&i| self.selected_providers[i]);
         let new_val = !all_selected;
-        for s in &mut self.selected_providers {
-            *s = new_val;
+        for &i in &filtered {
+            self.selected_providers[i] = new_val;
         }
         self.apply_filters();
     }
 
     pub fn provider_popup_clear_all(&mut self) {
-        for s in &mut self.selected_providers {
-            *s = false;
+        for &i in &self.provider_filtered_indices() {
+            self.selected_providers[i] = false;
         }
         self.apply_filters();
     }
@@ -2680,11 +2924,7 @@ impl App {
             .map(|m| {
                 let mut fit =
                     ModelFit::analyze_with_context_limit(m, &self.specs, self.context_limit);
-                fit.installed = providers::is_model_installed(&m.name, &self.ollama_installed)
-                    || providers::is_model_installed_mlx(&m.name, &self.mlx_installed)
-                    || providers::is_model_installed_llamacpp(&m.name, &self.llamacpp_installed)
-                    || providers::is_model_installed_docker_mr(&m.name, &self.docker_mr_installed)
-                    || providers::is_model_installed_lmstudio(&m.name, &self.lmstudio_installed);
+                fit.installed = self.installed.is_installed(&m.name);
                 fit
             })
             .collect();
@@ -3104,11 +3344,7 @@ impl App {
             .map(|m| {
                 let mut fit =
                     ModelFit::analyze_with_config(m, &self.specs, self.calc_config.clone());
-                fit.installed = providers::is_model_installed(&m.name, &self.ollama_installed)
-                    || providers::is_model_installed_mlx(&m.name, &self.mlx_installed)
-                    || providers::is_model_installed_llamacpp(&m.name, &self.llamacpp_installed)
-                    || providers::is_model_installed_docker_mr(&m.name, &self.docker_mr_installed)
-                    || providers::is_model_installed_lmstudio(&m.name, &self.lmstudio_installed);
+                fit.installed = self.installed.is_installed(&m.name);
                 fit
             })
             .collect();
@@ -3517,38 +3753,27 @@ impl App {
 
     /// Re-query all providers for installed models and update all_fits.
     pub fn refresh_installed(&mut self) {
-        let (ollama_set, ollama_count) = self.ollama.installed_models_counted();
-        self.ollama_installed = ollama_set;
-        self.ollama_installed_count = ollama_count;
-        self.mlx_installed = self.mlx.installed_models();
-        let (llamacpp_set, llamacpp_count) = self.llamacpp.installed_models_counted();
-        self.llamacpp_installed = llamacpp_set;
-        self.llamacpp_installed_count = llamacpp_count;
-        let (docker_mr_set, docker_mr_count) = self.docker_mr.installed_models_counted();
-        self.docker_mr_installed = docker_mr_set;
-        self.docker_mr_installed_count = docker_mr_count;
-        let (lmstudio_set, lmstudio_count) = self.lmstudio.installed_models_counted();
-        self.lmstudio_installed = lmstudio_set;
-        self.lmstudio_installed_count = lmstudio_count;
-        let (vllm_set, vllm_count) = self.vllm.installed_models_counted();
-        self.vllm_installed = vllm_set;
-        self.vllm_installed_count = vllm_count;
+        let (ollama, ollama_count) = self.ollama.installed_models_counted();
+        let mlx = self.mlx.installed_models();
+        let (llamacpp, llamacpp_count) = self.llamacpp.installed_models_counted();
+        let (docker_mr, docker_mr_count) = self.docker_mr.installed_models_counted();
+        let (lmstudio, lmstudio_count) = self.lmstudio.installed_models_counted();
+        let (vllm, vllm_count) = self.vllm.installed_models_counted();
+        self.installed = llmfit_core::analysis::InstalledIndex {
+            ollama,
+            ollama_count,
+            mlx,
+            llamacpp,
+            llamacpp_count,
+            docker_mr,
+            docker_mr_count,
+            lmstudio,
+            lmstudio_count,
+            vllm,
+            vllm_count,
+        };
         for fit in &mut self.all_fits {
-            fit.installed = providers::is_model_installed(&fit.model.name, &self.ollama_installed)
-                || providers::is_model_installed_mlx(&fit.model.name, &self.mlx_installed)
-                || providers::is_model_installed_llamacpp(
-                    &fit.model.name,
-                    &self.llamacpp_installed,
-                )
-                || providers::is_model_installed_docker_mr(
-                    &fit.model.name,
-                    &self.docker_mr_installed,
-                )
-                || providers::is_model_installed_lmstudio(
-                    &fit.model.name,
-                    &self.lmstudio_installed,
-                )
-                || providers::is_model_installed_vllm(&fit.model.name, &self.vllm_installed);
+            fit.installed = self.installed.is_installed(&fit.model.name);
         }
         self.re_sort();
         self.enqueue_capability_probes_for_visible(24);
@@ -3653,8 +3878,8 @@ impl App {
                         } => {
                             self.ollama_available = available;
                             self.ollama_binary_available = binary_available;
-                            self.ollama_installed = installed;
-                            self.ollama_installed_count = installed_count;
+                            self.installed.ollama = installed;
+                            self.installed.ollama_count = installed_count;
                             self.ollama = provider;
                         }
                         ProviderDetectionMsg::Mlx {
@@ -3662,7 +3887,7 @@ impl App {
                             installed,
                         } => {
                             self.mlx_available = available;
-                            self.mlx_installed = installed;
+                            self.installed.mlx = installed;
                         }
                         ProviderDetectionMsg::DockerMr {
                             available,
@@ -3670,8 +3895,8 @@ impl App {
                             installed_count,
                         } => {
                             self.docker_mr_available = available;
-                            self.docker_mr_installed = installed;
-                            self.docker_mr_installed_count = installed_count;
+                            self.installed.docker_mr = installed;
+                            self.installed.docker_mr_count = installed_count;
                         }
                         ProviderDetectionMsg::LmStudio {
                             available,
@@ -3679,8 +3904,8 @@ impl App {
                             installed_count,
                         } => {
                             self.lmstudio_available = available;
-                            self.lmstudio_installed = installed;
-                            self.lmstudio_installed_count = installed_count;
+                            self.installed.lmstudio = installed;
+                            self.installed.lmstudio_count = installed_count;
                         }
                         ProviderDetectionMsg::Vllm {
                             available,
@@ -3688,8 +3913,8 @@ impl App {
                             installed_count,
                         } => {
                             self.vllm_available = available;
-                            self.vllm_installed = installed;
-                            self.vllm_installed_count = installed_count;
+                            self.installed.vllm = installed;
+                            self.installed.vllm_count = installed_count;
                         }
                     }
                 }
@@ -3703,25 +3928,7 @@ impl App {
         if got_any {
             // Re-mark installed status for all models
             for fit in &mut self.all_fits {
-                fit.installed =
-                    providers::is_model_installed(&fit.model.name, &self.ollama_installed)
-                        || providers::is_model_installed_mlx(&fit.model.name, &self.mlx_installed)
-                        || providers::is_model_installed_llamacpp(
-                            &fit.model.name,
-                            &self.llamacpp_installed,
-                        )
-                        || providers::is_model_installed_docker_mr(
-                            &fit.model.name,
-                            &self.docker_mr_installed,
-                        )
-                        || providers::is_model_installed_lmstudio(
-                            &fit.model.name,
-                            &self.lmstudio_installed,
-                        )
-                        || providers::is_model_installed_vllm(
-                            &fit.model.name,
-                            &self.vllm_installed,
-                        );
+                fit.installed = self.installed.is_installed(&fit.model.name);
             }
             self.re_sort();
         }
@@ -3784,7 +3991,8 @@ impl App {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut installed: Vec<String> = self
-            .ollama_installed
+            .installed
+            .ollama
             .iter()
             .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
             .collect();
@@ -3815,7 +4023,8 @@ impl App {
 
         // Check if installed models match
         let mut installed: Vec<String> = self
-            .ollama_installed
+            .installed
+            .ollama
             .iter()
             .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
             .collect();
@@ -3908,7 +4117,8 @@ impl App {
         // Deduplicate: strip ":latest" suffix and remove dupes
         let mut seen = std::collections::HashSet::new();
         let mut models: Vec<String> = self
-            .ollama_installed
+            .installed
+            .ollama
             .iter()
             .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
             .filter(|m| seen.insert(m.clone()))
@@ -4117,4 +4327,251 @@ fn command_exists(name: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llmfit_core::fit::{InferenceRuntime, RunMode, ScoreComponents};
+    use llmfit_core::hardware::GpuBackend;
+    use llmfit_core::models::{LlmModel, ModelFormat, UseCase};
+
+    fn test_app() -> App {
+        App::with_specs_and_context(
+            SystemSpecs {
+                total_ram_gb: 16.0,
+                available_ram_gb: 12.0,
+                total_cpu_cores: 8,
+                cpu_name: "Test CPU".to_string(),
+                has_gpu: false,
+                gpu_vram_gb: None,
+                total_gpu_vram_gb: None,
+                gpu_name: None,
+                gpu_count: 0,
+                unified_memory: false,
+                backend: GpuBackend::CpuX86,
+                gpus: Vec::new(),
+                cluster_mode: false,
+                cluster_node_count: 0,
+            },
+            None,
+        )
+    }
+
+    fn test_model(name: &str) -> LlmModel {
+        LlmModel {
+            name: name.to_string(),
+            provider: "Test".to_string(),
+            parameter_count: "7B".to_string(),
+            parameters_raw: None,
+            min_ram_gb: 4.0,
+            recommended_ram_gb: 8.0,
+            min_vram_gb: Some(4.0),
+            quantization: "Q4_K_M".to_string(),
+            context_length: 8192,
+            use_case: "General".to_string(),
+            is_moe: false,
+            num_experts: None,
+            active_experts: None,
+            active_parameters: None,
+            release_date: None,
+            gguf_sources: Vec::new(),
+            capabilities: Vec::new(),
+            format: ModelFormat::Gguf,
+            num_attention_heads: None,
+            num_key_value_heads: None,
+            num_hidden_layers: None,
+            head_dim: None,
+            attention_layout: None,
+            license: None,
+            hidden_size: None,
+            moe_intermediate_size: None,
+            vocab_size: None,
+            shared_expert_intermediate_size: None,
+            architecture: None,
+        }
+    }
+
+    fn test_fit(name: &str, fit_level: FitLevel, score: f64) -> ModelFit {
+        ModelFit {
+            model: test_model(name),
+            fit_level,
+            run_mode: RunMode::Gpu,
+            memory_required_gb: 4.0,
+            memory_available_gb: 8.0,
+            utilization_pct: 50.0,
+            notes: Vec::new(),
+            moe_offloaded_gb: None,
+            score,
+            score_components: ScoreComponents {
+                quality: score,
+                speed: score,
+                fit: score,
+                context: score,
+            },
+            estimated_tps: 10.0,
+            best_quant: "Q4_K_M".to_string(),
+            use_case: UseCase::General,
+            runtime: InferenceRuntime::LlamaCpp,
+            installed: false,
+            fits_with_turboquant: false,
+            effective_context_length: 8192,
+        }
+    }
+
+    #[test]
+    fn initial_best_fit_row_selects_highest_scoring_perfect_or_good_fit() {
+        let fits = vec![
+            test_fit("high marginal", FitLevel::Marginal, 99.0),
+            test_fit("good", FitLevel::Good, 70.0),
+            test_fit("perfect", FitLevel::Perfect, 65.0),
+            test_fit("best good", FitLevel::Good, 95.0),
+        ];
+
+        assert_eq!(App::initial_best_fit_row(&[0, 1, 2, 3], &fits), 3);
+    }
+
+    #[test]
+    fn initial_best_fit_row_falls_back_to_first_row_without_compatible_models() {
+        let fits = vec![
+            test_fit("marginal", FitLevel::Marginal, 80.0),
+            test_fit("too tight", FitLevel::TooTight, 90.0),
+        ];
+
+        assert_eq!(App::initial_best_fit_row(&[0, 1], &fits), 0);
+        assert_eq!(App::initial_best_fit_row(&[], &fits), 0);
+    }
+
+    #[test]
+    fn fuzzy_match_empty_query_matches_everything() {
+        assert!(fuzzy_match("", "Ollama"));
+        assert!(fuzzy_match("", ""));
+    }
+
+    #[test]
+    fn fuzzy_match_is_case_insensitive_subsequence() {
+        // Contiguous substring
+        assert!(fuzzy_match("oll", "Ollama"));
+        // Non-contiguous subsequence, mixed case
+        assert!(fuzzy_match("opn", "OpenAI"));
+        assert!(fuzzy_match("MLX", "mlx"));
+        // Order matters
+        assert!(!fuzzy_match("alo", "Ollama"));
+        // Char not present
+        assert!(!fuzzy_match("ollamax", "Ollama"));
+        assert!(!fuzzy_match("z", "Anthropic"));
+    }
+
+    #[test]
+    fn ascii_graphic_input_inserts_at_cursor_and_rejects_non_ascii() {
+        let mut value = "Ollma".to_string();
+        let mut cursor = "Oll".len();
+
+        insert_ascii_graphic_input(&mut value, &mut cursor, 'a');
+        assert_eq!(value, "Ollama");
+        assert_eq!(cursor, "Olla".len());
+
+        insert_ascii_graphic_input(&mut value, &mut cursor, '你');
+        insert_ascii_graphic_input(&mut value, &mut cursor, ' ');
+        assert_eq!(value, "Ollama");
+        assert_eq!(cursor, "Olla".len());
+    }
+
+    #[test]
+    fn grapheme_input_backspace_and_delete_edit_at_cursor() {
+        let mut value = "LLaamCpp".to_string();
+        let mut cursor = "LLa".len();
+
+        backspace_grapheme_input(&mut value, &mut cursor);
+        assert_eq!(value, "LLamCpp");
+        assert_eq!(cursor, "LL".len());
+
+        delete_grapheme_input(&mut value, cursor);
+        assert_eq!(value, "LLmCpp");
+        assert_eq!(cursor, "LL".len());
+    }
+
+    #[test]
+    fn search_grapheme_boundaries_keep_emoji_sequences_together() {
+        let query = "a👩‍💻b";
+        let after_a = "a".len();
+        let after_emoji = after_a + "👩‍💻".len();
+
+        assert_eq!(next_grapheme_boundary(query, after_a), after_emoji);
+        assert_eq!(previous_grapheme_boundary(query, after_emoji), after_a);
+    }
+
+    #[test]
+    fn search_grapheme_boundaries_handle_multibyte_text() {
+        let query = "a你好";
+        let after_a = "a".len();
+        let after_ni = after_a + "你".len();
+
+        assert_eq!(next_grapheme_boundary(query, after_a), after_ni);
+        assert_eq!(previous_grapheme_boundary(query, after_ni), after_a);
+    }
+
+    #[test]
+    fn download_dir_input_handles_multibyte_text_without_invalid_boundaries() {
+        let mut app = test_app();
+
+        app.insert_dm_dir_char('模');
+        app.insert_dm_dir_char('型');
+        app.insert_dm_dir_char('一');
+
+        assert_eq!(app.dm_dir_input, "模型一");
+        assert_eq!(app.dm_dir_cursor, "模型一".len());
+
+        app.dm_dir_cursor_left();
+        assert_eq!(app.dm_dir_cursor, "模型".len());
+
+        app.insert_dm_dir_char('二');
+        assert_eq!(app.dm_dir_input, "模型二一");
+        assert_eq!(app.dm_dir_cursor, "模型二".len());
+
+        app.dm_dir_backspace();
+        assert_eq!(app.dm_dir_input, "模型一");
+        assert_eq!(app.dm_dir_cursor, "模型".len());
+    }
+
+    #[test]
+    fn download_dir_input_deletes_whole_emoji_graphemes() {
+        let mut app = test_app();
+        app.dm_dir_input = "a👩‍💻b".to_string();
+        app.dm_dir_cursor = "a".len();
+
+        app.dm_dir_delete();
+        assert_eq!(app.dm_dir_input, "ab");
+        assert_eq!(app.dm_dir_cursor, "a".len());
+
+        app.insert_dm_dir_char('🚀');
+        assert_eq!(app.dm_dir_input, "a🚀b");
+        assert_eq!(app.dm_dir_cursor, "a🚀".len());
+
+        app.dm_dir_backspace();
+        assert_eq!(app.dm_dir_input, "ab");
+        assert_eq!(app.dm_dir_cursor, "a".len());
+    }
+
+    #[test]
+    fn download_dir_input_repairs_non_boundary_cursor_before_editing() {
+        let mut app = test_app();
+        app.dm_dir_input = "一a".to_string();
+        app.dm_dir_cursor = 1;
+
+        app.insert_dm_dir_char('二');
+        assert_eq!(app.dm_dir_input, "二一a");
+        assert_eq!(app.dm_dir_cursor, "二".len());
+    }
+
+    #[test]
+    fn download_dir_backspace_repairs_non_boundary_cursor_before_editing() {
+        let mut app = test_app();
+        app.dm_dir_input = "一a".to_string();
+        app.dm_dir_cursor = 2;
+
+        app.dm_dir_backspace();
+        assert_eq!(app.dm_dir_input, "一a");
+        assert_eq!(app.dm_dir_cursor, 0);
+    }
 }

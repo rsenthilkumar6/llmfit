@@ -957,11 +957,6 @@ fn run_fit(
     overrides: &HardwareOverrides,
     context_limit: Option<u32>,
 ) {
-    use llmfit_core::providers::{
-        self as provs, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
-        ModelProvider, OllamaProvider,
-    };
-
     let specs = detect_specs(overrides);
     let db = ModelDatabase::new();
 
@@ -969,13 +964,7 @@ fn run_fit(
         specs.display();
     }
 
-    // Query installed models across local providers so that `fit.installed`
-    // is populated in both text and JSON output — same behaviour as `recommend`.
-    let ollama_installed = OllamaProvider::new().installed_models();
-    let mlx_installed = MlxProvider::new().installed_models();
-    let llamacpp_installed = LlamaCppProvider::new().installed_models();
-    let docker_mr_installed = DockerModelRunnerProvider::new().installed_models();
-    let lmstudio_installed = LmStudioProvider::new().installed_models();
+    let installed = llmfit_core::analysis::InstalledIndex::detect_all();
 
     let hidden: usize = db
         .get_all_models()
@@ -983,20 +972,8 @@ fn run_fit(
         .filter(|m| !backend_compatible(m, &specs))
         .count();
 
-    let mut fits: Vec<ModelFit> = db
-        .get_all_models()
-        .iter()
-        .filter(|m| backend_compatible(m, &specs))
-        .map(|m| {
-            let mut fit = ModelFit::analyze_with_context_limit(m, &specs, context_limit);
-            fit.installed = provs::is_model_installed(&m.name, &ollama_installed)
-                || provs::is_model_installed_mlx(&m.name, &mlx_installed)
-                || provs::is_model_installed_llamacpp(&m.name, &llamacpp_installed)
-                || provs::is_model_installed_docker_mr(&m.name, &docker_mr_installed)
-                || provs::is_model_installed_lmstudio(&m.name, &lmstudio_installed);
-            fit
-        })
-        .collect();
+    let mut fits =
+        llmfit_core::analysis::build_model_fits(&db, &specs, &installed, context_limit, None);
 
     if perfect {
         fits.retain(|f| f.fit_level == llmfit_core::fit::FitLevel::Perfect);
@@ -1307,35 +1284,10 @@ fn run_recommend(
             }
         });
 
-    // Query installed models across local providers so that `fit.installed`
-    // is populated for CLI output (same behavior as the TUI). This also causes
-    // backends like Docker Model Runner to receive a probe request when
-    // DOCKER_MODEL_RUNNER_HOST is set.
-    use llmfit_core::providers::{
-        self as provs, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
-        ModelProvider, OllamaProvider,
-    };
-    let ollama_installed = OllamaProvider::new().installed_models();
-    let mlx_installed = MlxProvider::new().installed_models();
-    let llamacpp_installed = LlamaCppProvider::new().installed_models();
-    let docker_mr_installed = DockerModelRunnerProvider::new().installed_models();
-    let lmstudio_installed = LmStudioProvider::new().installed_models();
+    let installed = llmfit_core::analysis::InstalledIndex::detect_all();
 
-    let mut fits: Vec<ModelFit> = db
-        .get_all_models()
-        .iter()
-        .filter(|m| backend_compatible(m, &specs))
-        .map(|m| {
-            let mut fit =
-                ModelFit::analyze_with_forced_runtime(m, &specs, context_limit, forced_rt);
-            fit.installed = provs::is_model_installed(&m.name, &ollama_installed)
-                || provs::is_model_installed_mlx(&m.name, &mlx_installed)
-                || provs::is_model_installed_llamacpp(&m.name, &llamacpp_installed)
-                || provs::is_model_installed_docker_mr(&m.name, &docker_mr_installed)
-                || provs::is_model_installed_lmstudio(&m.name, &lmstudio_installed);
-            fit
-        })
-        .collect();
+    let mut fits =
+        llmfit_core::analysis::build_model_fits(&db, &specs, &installed, context_limit, forced_rt);
 
     // Filter by minimum fit level
     let min_level = match min_fit.to_lowercase().as_str() {
@@ -2599,7 +2551,30 @@ fn main() {
             Commands::Search { query } => {
                 let db = ModelDatabase::new();
                 let results = db.find_model(&query);
-                display::display_search_results(&results, &query);
+                if results.is_empty() {
+                    // Fallback: search HuggingFace directly for GGUF models
+                    use llmfit_core::providers::LlamaCppProvider;
+                    println!(
+                        "\nNo local models found matching '{}'. Searching HuggingFace...\n",
+                        query
+                    );
+                    let hf_results = LlamaCppProvider::search_hf_gguf(&query);
+                    if hf_results.is_empty() {
+                        println!("No models found matching '{}'.", query);
+                    } else {
+                        println!("{:<50} Type", "Repository");
+                        println!("{}", "-".repeat(65));
+                        for (id, desc) in hf_results.iter().take(20) {
+                            println!("{:<50} {}", id, desc);
+                        }
+                        println!("\nTo download: llmfit download <repository>");
+                        println!(
+                            "Tip: run 'llmfit update' to add trending models to the local index."
+                        );
+                    }
+                } else {
+                    display::display_search_results(&results, &query);
+                }
             }
 
             Commands::Info { model } => {

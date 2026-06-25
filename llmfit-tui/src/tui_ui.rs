@@ -18,7 +18,10 @@ use crate::tui_app::{
 };
 use llmfit_core::fit::{FitLevel, ModelFit, SortColumn};
 use llmfit_core::hardware::is_running_in_wsl;
-use llmfit_core::providers;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+const DM_MODELS_DIR_LABEL: &str = "  Models dir:  ";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let tc = app.theme.colors();
@@ -131,7 +134,7 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     };
 
     let ollama_info = if app.ollama_available {
-        format!("Ollama: ✓ ({} installed)", app.ollama_installed_count)
+        format!("Ollama: ✓ ({} installed)", app.installed.ollama_count)
     } else {
         "Ollama: ✗".to_string()
     };
@@ -142,15 +145,15 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     };
 
     let mlx_info = if app.mlx_available {
-        format!("MLX: ✓ ({} installed)", app.mlx_installed.len())
-    } else if !app.mlx_installed.is_empty() {
-        format!("MLX: ({} cached)", app.mlx_installed.len())
+        format!("MLX: ✓ ({} installed)", app.installed.mlx.len())
+    } else if !app.installed.mlx.is_empty() {
+        format!("MLX: ({} cached)", app.installed.mlx.len())
     } else {
         "MLX: ✗".to_string()
     };
     let mlx_color = if app.mlx_available {
         tc.good
-    } else if !app.mlx_installed.is_empty() {
+    } else if !app.installed.mlx.is_empty() {
         tc.warning
     } else {
         tc.muted
@@ -158,25 +161,25 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     let llamacpp_info = if app.llamacpp_available {
         if app.llamacpp_detection_hint.is_empty() {
-            format!("llama.cpp: ✓ ({} models)", app.llamacpp_installed_count)
+            format!("llama.cpp: ✓ ({} models)", app.installed.llamacpp_count)
         } else {
             format!("llama.cpp: ✓ ({})", app.llamacpp_detection_hint)
         }
-    } else if !app.llamacpp_installed.is_empty() {
-        format!("llama.cpp: ({} cached)", app.llamacpp_installed_count)
+    } else if !app.installed.llamacpp.is_empty() {
+        format!("llama.cpp: ({} cached)", app.installed.llamacpp_count)
     } else {
         format!("llama.cpp: ✗ ({})", app.llamacpp_detection_hint)
     };
     let llamacpp_color = if app.llamacpp_available {
         tc.good
-    } else if !app.llamacpp_installed.is_empty() {
+    } else if !app.installed.llamacpp.is_empty() {
         tc.warning
     } else {
         tc.muted
     };
 
     let docker_mr_info = if app.docker_mr_available {
-        format!("Docker: ✓ ({} models)", app.docker_mr_installed_count)
+        format!("Docker: ✓ ({} models)", app.installed.docker_mr_count)
     } else {
         "Docker: ✗".to_string()
     };
@@ -187,7 +190,7 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     };
 
     let lmstudio_info = if app.lmstudio_available {
-        format!("LM Studio: ✓ ({} models)", app.lmstudio_installed_count)
+        format!("LM Studio: ✓ ({} models)", app.installed.lmstudio_count)
     } else {
         "LM Studio: ✗".to_string()
     };
@@ -198,7 +201,7 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     };
 
     let vllm_info = if app.vllm_available {
-        format!("vLLM: ✓ ({} models)", app.vllm_installed_count)
+        format!("vLLM: ✓ ({} models)", app.installed.vllm_count)
     } else {
         "vLLM: ✗".to_string()
     };
@@ -285,6 +288,93 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     frame.render_widget(paragraph, area);
 }
 
+fn visible_search_query(query: &str, cursor_position: usize, width: usize) -> (String, u16) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+
+    let cursor_position = cursor_position.min(query.len());
+    let cursor_position = floor_grapheme_boundary(query, cursor_position);
+    let text_width = width.saturating_sub(1);
+
+    if text_width == 0 {
+        return (String::new(), 0);
+    }
+
+    if UnicodeWidthStr::width(query) <= text_width {
+        return (
+            query.to_string(),
+            UnicodeWidthStr::width(&query[..cursor_position]).min(width.saturating_sub(1)) as u16,
+        );
+    }
+
+    let graphemes: Vec<(usize, &str, usize)> = query
+        .grapheme_indices(true)
+        .map(|(idx, grapheme)| (idx, grapheme, UnicodeWidthStr::width(grapheme)))
+        .collect();
+
+    let cursor_grapheme = graphemes
+        .iter()
+        .take_while(|(idx, _, _)| *idx < cursor_position)
+        .count();
+
+    let mut start = cursor_grapheme;
+    let mut cells_before_cursor = 0;
+    while start > 0 {
+        let previous_width = graphemes[start - 1].2;
+        if cells_before_cursor + previous_width > text_width {
+            break;
+        }
+        cells_before_cursor += previous_width;
+        start -= 1;
+    }
+
+    let start_byte = graphemes.get(start).map(|(idx, _, _)| *idx).unwrap_or(0);
+    let mut end = start;
+    let mut visible_cells = 0;
+    while let Some((_, _, grapheme_width)) = graphemes.get(end) {
+        if visible_cells + grapheme_width > text_width {
+            break;
+        }
+        visible_cells += grapheme_width;
+        end += 1;
+    }
+
+    let end_byte = graphemes
+        .get(end)
+        .map(|(idx, _, _)| *idx)
+        .unwrap_or_else(|| query.len());
+    let visible = query[start_byte..end_byte].to_string();
+    let cursor_offset = UnicodeWidthStr::width(&query[start_byte..cursor_position])
+        .min(width.saturating_sub(1)) as u16;
+
+    (visible, cursor_offset)
+}
+
+fn visible_dm_dir_input(input: &str, cursor: usize, inner_width: u16) -> (String, u16) {
+    let label_width = UnicodeWidthStr::width(DM_MODELS_DIR_LABEL) as u16;
+    let input_width = inner_width.saturating_sub(label_width) as usize;
+    visible_search_query(input, cursor, input_width)
+}
+
+fn floor_grapheme_boundary(value: &str, index: usize) -> usize {
+    let mut index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    if index == value.len() {
+        return index;
+    }
+
+    for (start, grapheme) in value.grapheme_indices(true) {
+        if start + grapheme.len() > index {
+            return start;
+        }
+    }
+
+    index
+}
+
 fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -325,13 +415,17 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         | InputMode::Benchmarks => Style::default().fg(tc.muted),
     };
 
+    let search_inner_width = chunks[0].width.saturating_sub(2) as usize;
+    let (visible_query, cursor_offset) =
+        visible_search_query(&app.search_query, app.cursor_position, search_inner_width);
+
     let search_text = if app.search_query.is_empty() && app.input_mode == InputMode::Normal {
         Line::from(Span::styled(
             "Press / to search...",
             Style::default().fg(tc.muted),
         ))
     } else {
-        Line::from(Span::styled(&app.search_query, Style::default().fg(tc.fg)))
+        Line::from(Span::styled(visible_query, Style::default().fg(tc.fg)))
     };
 
     let search_block = Block::default()
@@ -344,10 +438,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     frame.render_widget(search, chunks[0]);
 
     if app.input_mode == InputMode::Search {
-        frame.set_cursor_position((
-            chunks[0].x + app.cursor_position as u16 + 1,
-            chunks[0].y + 1,
-        ));
+        frame.set_cursor_position((chunks[0].x + cursor_offset + 1, chunks[0].y + 1));
     }
 
     // Provider filter summary
@@ -1687,30 +1778,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         Line::from(vec![
             Span::styled("  Installed:   ", Style::default().fg(tc.muted)),
             {
-                let mut installed_providers = Vec::new();
-                if providers::is_model_installed(&fit.model.name, &app.ollama_installed) {
-                    installed_providers.push("Ollama");
-                }
-                if providers::is_model_installed_mlx(&fit.model.name, &app.mlx_installed) {
-                    installed_providers.push("MLX");
-                }
-                if providers::is_model_installed_llamacpp(&fit.model.name, &app.llamacpp_installed)
-                {
-                    installed_providers.push("llama.cpp");
-                }
-                if providers::is_model_installed_docker_mr(
-                    &fit.model.name,
-                    &app.docker_mr_installed,
-                ) {
-                    installed_providers.push("Docker");
-                }
-                if providers::is_model_installed_lmstudio(&fit.model.name, &app.lmstudio_installed)
-                {
-                    installed_providers.push("LM Studio");
-                }
-                if providers::is_model_installed_vllm(&fit.model.name, &app.vllm_installed) {
-                    installed_providers.push("vLLM");
-                }
+                let installed_providers = app.installed.installed_providers(&fit.model.name);
                 let any_available = app.ollama_available
                     || app.mlx_available
                     || app.llamacpp_available
@@ -2439,9 +2507,16 @@ fn draw_plan(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     let area = frame.area();
 
+    let filtered = app.provider_filtered_indices();
+
     let max_name_len = app.providers.iter().map(|p| p.len()).max().unwrap_or(10);
-    let popup_width = (max_name_len as u16 + 10).min(area.width.saturating_sub(4));
-    let popup_height = (app.providers.len() as u16 + 2).min(area.height.saturating_sub(4));
+    // Width must also fit the search box / hint line.
+    let popup_width = (max_name_len as u16 + 10)
+        .max(28)
+        .min(area.width.saturating_sub(4));
+    // +2 borders, +1 search row. List body shows at most all matches.
+    let list_rows = (filtered.len().max(1) as u16).min(area.height.saturating_sub(6));
+    let popup_height = (list_rows + 3).min(area.height.saturating_sub(4));
 
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
@@ -2449,28 +2524,64 @@ fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     frame.render_widget(Clear, popup_area);
 
-    let inner_height = popup_height.saturating_sub(2) as usize;
+    // The list body is the popup height minus borders (2) minus the search row (1).
+    let inner_height = popup_height.saturating_sub(3) as usize;
     let total = app.providers.len();
 
     let scroll_offset = if app.provider_cursor >= inner_height {
-        app.provider_cursor - inner_height + 1
+        app.provider_cursor + 1 - inner_height
     } else {
         0
     };
 
-    let lines: Vec<Line> = app
-        .providers
-        .iter()
-        .enumerate()
-        .skip(scroll_offset)
-        .take(inner_height)
-        .map(|(i, name)| {
+    // Search input row.
+    let mut lines: Vec<Line> = Vec::with_capacity(inner_height + 1);
+    let search_prefix = " / ";
+    let search_inner_width = popup_width.saturating_sub(2) as usize;
+    let search_query_width = search_inner_width.saturating_sub(search_prefix.len());
+    let (visible_provider_search, provider_cursor_offset) = visible_search_query(
+        &app.provider_search,
+        app.provider_search_cursor_position,
+        search_query_width,
+    );
+    let search_display = if app.provider_search.is_empty() {
+        Line::from(vec![
+            Span::styled(search_prefix, Style::default().fg(tc.fg)),
+            Span::styled(
+                "type to filter",
+                Style::default().fg(tc.muted).add_modifier(Modifier::ITALIC),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(search_prefix, Style::default().fg(tc.fg)),
+            Span::styled(
+                visible_provider_search,
+                Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
+    lines.push(search_display);
+
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (no matching providers)",
+            Style::default().fg(tc.muted),
+        )));
+    } else {
+        for (pos, &i) in filtered
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(inner_height)
+        {
+            let name = &app.providers[i];
             let checkbox = if app.selected_providers[i] {
                 "[x]"
             } else {
                 "[ ]"
             };
-            let is_cursor = i == app.provider_cursor;
+            let is_cursor = pos == app.provider_cursor;
 
             let style = if is_cursor {
                 if app.selected_providers[i] {
@@ -2490,12 +2601,24 @@ fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
                 Style::default().fg(tc.muted)
             };
 
-            Line::from(Span::styled(format!(" {} {}", checkbox, name), style))
-        })
-        .collect();
+            lines.push(Line::from(Span::styled(
+                format!(" {} {}", checkbox, name),
+                style,
+            )));
+        }
+    }
 
     let active_count = app.selected_providers.iter().filter(|&&s| s).count();
-    let title = format!(" Providers ({}/{}) ", active_count, total);
+    let title = if app.provider_search.is_empty() {
+        format!(" Providers ({}/{}) ", active_count, total)
+    } else {
+        format!(
+            " Providers ({}/{}) — {} match ",
+            active_count,
+            total,
+            filtered.len()
+        )
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2510,14 +2633,14 @@ fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         .title_bottom(
             Line::from(vec![
                 Span::styled(
-                    " a",
+                    " ^a",
                     Style::default()
                         .fg(tc.accent_secondary)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(": all | ", Style::default().fg(tc.muted)),
                 Span::styled(
-                    "c",
+                    "^n",
                     Style::default()
                         .fg(tc.accent_secondary)
                         .add_modifier(Modifier::BOLD),
@@ -2529,6 +2652,15 @@ fn draw_provider_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, popup_area);
+
+    let cursor_x = popup_area.x
+        + 1
+        + search_prefix.len() as u16
+        + provider_cursor_offset.min(search_query_width as u16);
+    let cursor_y = popup_area.y + 1;
+    if cursor_x < popup_area.x + popup_area.width.saturating_sub(1) {
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
 }
 
 fn draw_use_case_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
@@ -2804,7 +2936,7 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             };
             (
                 format!(
-                    " S:simulate  A:config  b:benchmarks  B:live-bench  h:help  {}  /:search  f:fit  F:filter  s:sort{}  P:providers  U:use cases  C:caps  R:runtime  q:quit",
+                    " S:simulate  A:config  b:benchmarks  I:live-bench  h:help  {}  /:search  f:fit  F:filter  s:sort{}  P:providers  U:use cases  C:caps  R:runtime  q:quit",
                     detail_key, ollama_keys,
                 ),
                 if app.sim_active {
@@ -2845,7 +2977,7 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             "PLAN".to_string(),
         ),
         InputMode::ProviderPopup => (
-            "  ↑↓/jk:navigate  Space:toggle  a:all/none  Esc:close".to_string(),
+            "  ↑↓:navigate (+Shift:speed up)  Space:toggle  a:all/none  Esc:close".to_string(),
             "PROVIDERS".to_string(),
         ),
         InputMode::UseCasePopup => (
@@ -3781,7 +3913,10 @@ fn draw_downloads(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             vertical: 1,
             horizontal: 1,
         });
-        let cursor_x = inner.x + 14 + app.dm_dir_cursor as u16;
+        let label_width = UnicodeWidthStr::width(DM_MODELS_DIR_LABEL) as u16;
+        let (_, cursor_offset) =
+            visible_dm_dir_input(&app.dm_dir_input, app.dm_dir_cursor, inner.width);
+        let cursor_x = inner.x + label_width + cursor_offset;
         let cursor_y = inner.y;
         if cursor_x < inner.x + inner.width {
             frame.set_cursor_position((cursor_x, cursor_y));
@@ -3852,23 +3987,22 @@ fn draw_dm_config(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         .border_style(border_style)
         .title(" Config ");
 
-    let dir_display = if app.dm_editing_dir {
-        app.dm_dir_input.as_str()
+    let visible_dir = if app.dm_editing_dir {
+        let inner_width = area.width.saturating_sub(2);
+        visible_dm_dir_input(&app.dm_dir_input, app.dm_dir_cursor, inner_width).0
     } else {
-        // Show current models dir from the llamacpp provider
-        // We use the public function as a fallback display
-        ""
+        String::new()
     };
 
     let line = if app.dm_editing_dir {
         Line::from(vec![
-            Span::styled("  Models dir:  ", Style::default().fg(tc.muted)),
-            Span::styled(dir_display, Style::default().fg(tc.fg)),
+            Span::styled(DM_MODELS_DIR_LABEL, Style::default().fg(tc.muted)),
+            Span::styled(visible_dir, Style::default().fg(tc.fg)),
             Span::styled("█", Style::default().fg(tc.accent)),
         ])
     } else {
         Line::from(vec![
-            Span::styled("  Models dir:  ", Style::default().fg(tc.muted)),
+            Span::styled(DM_MODELS_DIR_LABEL, Style::default().fg(tc.muted)),
             Span::styled(
                 app.llamacpp_models_dir().display().to_string(),
                 Style::default().fg(tc.fg),
@@ -5183,5 +5317,65 @@ mod tests {
         assert_eq!(truncate_str("🚀 hello", 4), "🚀 h~");
         // Exact max length — no truncation
         assert_eq!(truncate_str("abc", 3), "abc");
+    }
+
+    #[test]
+    fn visible_search_query_keeps_short_query_unchanged() {
+        assert_eq!(
+            visible_search_query("hello", 3, 10),
+            ("hello".to_string(), 3)
+        );
+    }
+
+    #[test]
+    fn visible_search_query_scrolls_to_keep_end_cursor_visible() {
+        assert_eq!(
+            visible_search_query("abcdefghijklmnopqrstuvwxyz", 26, 8),
+            ("tuvwxyz".to_string(), 7)
+        );
+    }
+
+    #[test]
+    fn visible_search_query_keeps_middle_cursor_visible() {
+        assert_eq!(
+            visible_search_query("abcdefghijklmnopqrstuvwxyz", 13, 8),
+            ("ghijklm".to_string(), 7)
+        );
+    }
+
+    #[test]
+    fn visible_search_query_handles_multibyte_cursor_boundaries() {
+        assert_eq!(
+            visible_search_query("你好世界abc", "你好世界abc".len(), 5),
+            ("abc".to_string(), 3)
+        );
+
+        assert_eq!(
+            visible_search_query("你好世界abc", 1, 5),
+            ("你好".to_string(), 0)
+        );
+    }
+
+    #[test]
+    fn visible_search_query_uses_terminal_cell_width() {
+        assert_eq!(
+            visible_search_query("ab😀cd", "ab😀cd".len(), 5),
+            ("😀cd".to_string(), 4)
+        );
+
+        assert_eq!(
+            visible_search_query("你好世界abc", "你好世界abc".len(), 6),
+            ("界abc".to_string(), 5)
+        );
+    }
+
+    #[test]
+    fn visible_dm_dir_input_keeps_unicode_cursor_visible() {
+        let input = "/tmp/模型/一二三四";
+
+        assert_eq!(
+            visible_dm_dir_input(input, input.len(), (DM_MODELS_DIR_LABEL.len() + 8) as u16),
+            ("二三四".to_string(), 6)
+        );
     }
 }

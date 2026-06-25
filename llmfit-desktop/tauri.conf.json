@@ -5,6 +5,11 @@
   "build": {
     "frontendDist": "./ui"
   },
+  "bundle": {
+    "windows": {
+      "webviewInstallMode": "downloadBootstrapper"
+    }
+  },
   "app": {
     "withGlobalTauri": true,
     "windows": [

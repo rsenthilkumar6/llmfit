@@ -60,6 +60,7 @@ TARGET_MODELS = [
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
     "mistralai/Ministral-8B-Instruct-2410",
     "mistralai/Mistral-Nemo-Instruct-2407",
+    "mistralai/Devstral-Small-2505",
     # Qwen
     "Qwen/Qwen2.5-7B-Instruct",
     "Qwen/Qwen2.5-14B-Instruct",
@@ -141,6 +142,8 @@ TARGET_MODELS = [
     "deepseek-ai/DeepSeek-V4-Flash-Base",
     # Cohere
     "CohereForAI/c4ai-command-r-v01",
+    "CohereForAI/c4ai-command-r-plus-08-2024",
+    "CohereForAI/c4ai-command-a-03-2025",
     # 01.ai Yi family
     "01-ai/Yi-6B-Chat",  # NEW: Popular multilingual 6B
     "01-ai/Yi-34B-Chat",  # NEW: Popular multilingual 34B
@@ -150,6 +153,7 @@ TARGET_MODELS = [
     "tiiuae/falcon-7b-instruct",  # NEW: Popular UAE model
     "tiiuae/falcon-40b-instruct",
     "tiiuae/falcon-180B-chat",
+    "tiiuae/Falcon3-3B-Instruct",
     "tiiuae/Falcon3-7B-Instruct",
     "tiiuae/Falcon3-10B-Instruct",
     # HuggingFace Zephyr
@@ -236,19 +240,23 @@ TARGET_MODELS = [
     "zai-org/GLM-5",
     # Moonshot Kimi K2.5
     "moonshotai/Kimi-K2.5",
-    # MiniMax M2.7 / M2.5
+    # MiniMax M3 / M2.7
+    "MiniMaxAI/MiniMax-M3",
     "MiniMaxAI/MiniMax-M2.7",
-    "MiniMaxAI/MiniMax-M2.5",
     # Xiaomi MiMo
     "XiaomiMiMo/MiMo-V2-Flash",
     "XiaomiMiMo/MiMo-7B-RL",
     # NVIDIA Nemotron
+    "nvidia/Llama-3.3-Nemotron-Super-49B-v1",
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
     "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
     # Microsoft Phi-4 reasoning family
     "microsoft/Phi-4-reasoning",
     "microsoft/Phi-4-mini-reasoning",
     "microsoft/Phi-4-multimodal-instruct",
+    # LG AI EXAONE Deep (reasoning)
+    "LGAI-EXAONE/EXAONE-Deep-2.4B",
+    "LGAI-EXAONE/EXAONE-Deep-32B",
     # LG AI EXAONE 4.0
     "LGAI-EXAONE/EXAONE-4.0-32B",
     "LGAI-EXAONE/EXAONE-4.0-1.2B",
@@ -262,6 +270,10 @@ TARGET_MODELS = [
     "shoumenchougou/RWKV7-G1f-2.9B-GGUF",
     "shoumenchougou/RWKV7-G1f-7.2B-GGUF",
     "shoumenchougou/RWKV7-G1f-13.3B-GGUF",
+    # NCAI VAETKI
+    "nc-ai-consortium/VAETKI-7B-A1B",
+    "nc-ai-consortium/VAETKI-20B-A2B",
+    "nc-ai-consortium/VAETKI-VL-7B-A1B",
 ]
 
 # Bytes-per-parameter for different quantization levels
@@ -330,13 +342,16 @@ MOE_ACTIVE_PARAMS = {
     "moonshotai/Kimi-K2-Instruct": 32_000_000_000,
     "moonshotai/Kimi-K2.5": 32_000_000_000,
     "zai-org/GLM-5": 40_000_000_000,
+    "MiniMaxAI/MiniMax-M3": 10_000_000_000,
     "MiniMaxAI/MiniMax-M2.7": 10_000_000_000,
-    "MiniMaxAI/MiniMax-M2.5": 10_000_000_000,
     "XiaomiMiMo/MiMo-V2-Flash": 15_000_000_000,
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": 3_000_000_000,
     "LiquidAI/LFM2-8B-A1B": 1_500_000_000,
     "LiquidAI/LFM2-24B-A2B": 2_300_000_000,  # 23.8B total, 2.3B active
     "google/gemma-4-26B-A4B-it": 4_000_000_000,
+    "nc-ai-consortium/VAETKI-7B-A1B": 1_200_000_000,
+    "nc-ai-consortium/VAETKI-20B-A2B": 2_200_000_000,
+    "nc-ai-consortium/VAETKI-VL-7B-A1B": 1_200_000_000,
 }
 
 
@@ -357,6 +372,37 @@ def fetch_model_info(repo_id: str) -> dict | None:
     except Exception as e:
         print(f"  ⚠ Error fetching {repo_id}: {e}", file=sys.stderr)
         return None
+
+
+def extract_license(info: dict | None) -> str | None:
+    """Extract normalized license metadata from HuggingFace model info."""
+    if not info:
+        return None
+
+    card_data = info.get("cardData") or {}
+    license_value = card_data.get("license")
+    license_name = card_data.get("license_name")
+
+    if isinstance(license_name, str) and license_name.strip():
+        license_name = license_name.strip().lower()
+    else:
+        license_name = None
+
+    if isinstance(license_value, str) and license_value.strip():
+        license_value = license_value.strip().lower()
+        return license_name if license_value == "other" and license_name else license_value
+    if isinstance(license_value, list):
+        licenses = [str(item).strip().lower() for item in license_value if str(item).strip()]
+        if licenses:
+            return ",".join(licenses)
+
+    for tag in info.get("tags", []):
+        if isinstance(tag, str) and tag.startswith("license:"):
+            license_tag = tag.removeprefix("license:").strip().lower()
+            if license_tag:
+                return license_name if license_tag == "other" and license_name else license_tag
+
+    return None
 
 
 def format_param_count(total_params: int) -> str:
@@ -588,6 +634,8 @@ def infer_use_case(repo_id: str, pipeline_tag: str | None, config: dict | None) 
         return "Code generation and completion"
     if "r1" in rid or "reason" in rid:
         return "Advanced reasoning, chain-of-thought"
+    if pipeline_tag in ("image-text-to-text", "any-to-any") or "-vl-" in rid:
+        return "Multimodal, vision and text"
     if "instruct" in rid or "chat" in rid:
         return "Instruction following, chat"
     if "tiny" in rid or "small" in rid or "mini" in rid:
@@ -681,6 +729,7 @@ def extract_provider(repo_id: str) -> str:
         "nousresearch": "NousResearch",  # NEW
         "wizardlmteam": "WizardLM",  # NEW
         "liquidai": "Liquid AI",
+        "nc-ai-consortium": "NCAI",
     }
     return mapping.get(org, org)
 
@@ -849,6 +898,8 @@ def scrape_model(repo_id: str) -> dict | None:
     # absent fields cause the Rust side to fall back to the linear approx.
     arch_meta = extract_arch_metadata(full_config)
 
+    license_name = extract_license(info)
+
     result = {
         "name": repo_id,
         "provider": extract_provider(repo_id),
@@ -869,6 +920,9 @@ def scrape_model(repo_id: str) -> dict | None:
         "release_date": (info.get("createdAt") or "")[:10] or None,
         **arch_meta,
     }
+
+    if license_name:
+        result["license"] = license_name
 
     # Add MoE fields if detected
     if moe_info["is_moe"]:
@@ -1137,7 +1191,8 @@ def _build_first_page_url(pipeline: str, sort: str, page_size: int) -> str:
         f"direction=-1&"
         f"limit={page_size}&"
         f"expand[]=safetensors&"
-        f"expand[]=config"
+        f"expand[]=config&"
+        f"expand[]=cardData"
     )
 
 
@@ -1376,7 +1431,7 @@ def _build_discovered_model(listing: dict) -> dict | None:
     """Build model dict from a listing returned by discover_trending_models.
 
     Only fetches config.json for accurate context length; all other metadata
-    comes from the listing data already obtained via expand=safetensors.
+    comes from the listing data already obtained via expand fields.
     """
     repo_id = listing["id"]
     total_params = listing["_total_params"]
@@ -1404,6 +1459,8 @@ def _build_discovered_model(listing: dict) -> dict | None:
     # Architecture metadata for the precise KV cache formula.
     arch_meta = extract_arch_metadata(full_config)
 
+    license_name = extract_license(listing)
+
     model = {
         "name": repo_id,
         "provider": extract_provider(repo_id),
@@ -1425,6 +1482,9 @@ def _build_discovered_model(listing: dict) -> dict | None:
         **arch_meta,
         "_discovered": True,
     }
+
+    if license_name:
+        model["license"] = license_name
 
     if moe_info["is_moe"]:
         model["is_moe"] = True
@@ -1973,28 +2033,28 @@ def main():
             "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-01-26",
         },
         {
+            "name": "MiniMaxAI/MiniMax-M3",
+            "provider": "MiniMax", "parameter_count": "230B",
+            "parameters_raw": 230000000000,
+            "min_ram_gb": 128.6, "recommended_ram_gb": 214.4, "min_vram_gb": 117.9,
+            "quantization": "Q4_K_M", "context_length": 524288,
+            "use_case": "Latest flagship: 512K context, 128K max output, image input",
+            "pipeline_tag": "text-generation", "architecture": "minimax",
+            "is_moe": True, "num_experts": 32, "active_experts": 2,
+            "active_parameters": 10000000000,
+            "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-06-03",
+        },
+        {
             "name": "MiniMaxAI/MiniMax-M2.7",
             "provider": "MiniMax", "parameter_count": "230B",
             "parameters_raw": 230000000000,
             "min_ram_gb": 128.6, "recommended_ram_gb": 214.4, "min_vram_gb": 117.9,
             "quantization": "Q4_K_M", "context_length": 131072,
-            "use_case": "Latest flagship with enhanced reasoning and coding",
+            "use_case": "Previous flagship with enhanced reasoning and coding",
             "pipeline_tag": "text-generation", "architecture": "minimax",
             "is_moe": True, "num_experts": 32, "active_experts": 2,
             "active_parameters": 10000000000,
             "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-03-18",
-        },
-        {
-            "name": "MiniMaxAI/MiniMax-M2.5",
-            "provider": "MiniMax", "parameter_count": "230B",
-            "parameters_raw": 230000000000,
-            "min_ram_gb": 128.6, "recommended_ram_gb": 214.4, "min_vram_gb": 117.9,
-            "quantization": "Q4_K_M", "context_length": 131072,
-            "use_case": "Coding, agentic tool use",
-            "pipeline_tag": "text-generation", "architecture": "minimax",
-            "is_moe": True, "num_experts": 32, "active_experts": 2,
-            "active_parameters": 10000000000,
-            "hf_downloads": 0, "hf_likes": 0, "release_date": "2026-02-11",
         },
         {
             "name": "XiaomiMiMo/MiMo-V2-Flash",
@@ -2618,6 +2678,11 @@ def main():
                 for old_model in existing:
                     name = old_model.get("name", "")
                     if name in fresh_by_name:
+                        fresh_model = fresh_by_name[name]
+                        if old_model.get("license") and not fresh_model.get("license"):
+                            fresh_model["license"] = old_model["license"]
+                        if old_model.get("gguf_sources") and not fresh_model.get("gguf_sources"):
+                            fresh_model["gguf_sources"] = old_model["gguf_sources"]
                         updated_count += 1
                     elif name:
                         # Historical model not in current scrape — keep it

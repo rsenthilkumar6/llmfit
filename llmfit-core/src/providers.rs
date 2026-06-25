@@ -457,6 +457,10 @@ fn check_mlx_python() -> bool {
 fn is_likely_mlx_repo(owner: &str, repo: &str) -> bool {
     let owner_lower = owner.to_lowercase();
     let repo_lower = repo.to_lowercase();
+    // Exclude GGUF repos — they belong to llama.cpp, not MLX
+    if is_likely_gguf_repo(&repo_lower) {
+        return false;
+    }
     owner_lower == "mlx-community"
         || repo_lower.contains("-mlx-")
         || repo_lower.ends_with("-mlx")
@@ -464,47 +468,110 @@ fn is_likely_mlx_repo(owner: &str, repo: &str) -> bool {
         || repo_lower.ends_with("mlx")
 }
 
-/// Scan ~/.cache/huggingface/hub/ for MLX model directories.
+fn is_likely_gguf_repo(repo_lower: &str) -> bool {
+    repo_lower.contains("-gguf") || repo_lower.ends_with("gguf")
+}
+
+/// Scan HuggingFace cache directories for MLX model directories.
 fn scan_hf_cache_for_mlx() -> HashSet<String> {
     let mut set = HashSet::new();
-    let cache_dir = dirs_hf_cache();
-    let Ok(entries) = std::fs::read_dir(&cache_dir) else {
-        return set;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let Some(rest) = name_str.strip_prefix("models--") else {
+    for cache_dir in dirs_hf_cache_all() {
+        let Ok(entries) = std::fs::read_dir(&cache_dir) else {
             continue;
         };
-        let mut parts = rest.splitn(2, "--");
-        let Some(owner) = parts.next() else {
-            continue;
-        };
-        let Some(repo) = parts.next() else {
-            continue;
-        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let Some(rest) = name_str.strip_prefix("models--") else {
+                continue;
+            };
+            let mut parts = rest.splitn(2, "--");
+            let Some(owner) = parts.next() else {
+                continue;
+            };
+            let Some(repo) = parts.next() else {
+                continue;
+            };
 
-        if !is_likely_mlx_repo(owner, repo) {
-            continue;
+            if !is_likely_mlx_repo(owner, repo) {
+                continue;
+            }
+
+            let owner_lower = owner.to_lowercase();
+            let repo_lower = repo.to_lowercase();
+            set.insert(format!("{}/{}", owner_lower, repo_lower));
+            set.insert(repo_lower);
         }
-
-        let owner_lower = owner.to_lowercase();
-        let repo_lower = repo.to_lowercase();
-        set.insert(format!("{}/{}", owner_lower, repo_lower));
-        set.insert(repo_lower);
     }
     set
 }
 
-fn dirs_hf_cache() -> std::path::PathBuf {
-    if let Ok(cache) = std::env::var("HF_HOME") {
-        std::path::PathBuf::from(cache).join("hub")
-    } else if let Some(cache) = dirs::cache_dir() {
-        cache.join("huggingface").join("hub")
-    } else {
-        std::path::PathBuf::from("/tmp/.cache/huggingface/hub")
+/// Scan HuggingFace cache directories for GGUF model directories.
+fn scan_hf_cache_for_gguf() -> (HashSet<String>, usize) {
+    let mut set = HashSet::new();
+    let mut count = 0usize;
+    for cache_dir in dirs_hf_cache_all() {
+        let Ok(entries) = std::fs::read_dir(&cache_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let Some(rest) = name_str.strip_prefix("models--") else {
+                continue;
+            };
+            let mut parts = rest.splitn(2, "--");
+            let Some(owner) = parts.next() else {
+                continue;
+            };
+            let Some(repo) = parts.next() else {
+                continue;
+            };
+
+            if !is_likely_gguf_repo(&repo.to_lowercase()) {
+                continue;
+            }
+
+            count += 1;
+            let owner_lower = owner.to_lowercase();
+            let repo_lower = repo.to_lowercase();
+            set.insert(format!("{}/{}", owner_lower, repo_lower));
+            set.insert(repo_lower);
+        }
     }
+    (set, count)
+}
+
+/// Return all candidate HuggingFace cache directories.
+///
+/// The HF CLI always uses `~/.cache/huggingface/hub` (XDG-style) regardless
+/// of platform, but `dirs::cache_dir()` returns `~/Library/Caches` on macOS.
+/// We check both to handle either location.
+fn dirs_hf_cache_all() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Ok(cache) = std::env::var("HF_HOME") {
+        dirs.push(std::path::PathBuf::from(cache).join("hub"));
+        return dirs;
+    }
+
+    // Platform-native cache dir (e.g. ~/Library/Caches on macOS)
+    if let Some(cache) = dirs::cache_dir() {
+        dirs.push(cache.join("huggingface").join("hub"));
+    }
+
+    // XDG-style ~/.cache (what the HF CLI actually uses on all platforms)
+    if let Some(home) = dirs::home_dir() {
+        let xdg = home.join(".cache").join("huggingface").join("hub");
+        if !dirs.iter().any(|d| d == &xdg) {
+            dirs.push(xdg);
+        }
+    }
+
+    if dirs.is_empty() {
+        dirs.push(std::path::PathBuf::from("/tmp/.cache/huggingface/hub"));
+    }
+    dirs
 }
 
 impl ModelProvider for MlxProvider {
@@ -676,6 +743,10 @@ impl LlamaCppProvider {
                 }
             }
         }
+        // Also scan the HuggingFace cache for GGUF repos downloaded via `hf download`
+        let (hf_set, hf_count) = scan_hf_cache_for_gguf();
+        count += hf_count;
+        set.extend(hf_set);
         (set, count)
     }
 
@@ -1614,6 +1685,7 @@ impl ModelProvider for DockerModelRunnerProvider {
 /// `POST /api/v1/models/download` and listed via `GET /v1/models`.
 pub struct LmStudioProvider {
     base_url: String,
+    api_key: Option<String>,
 }
 
 fn normalize_lmstudio_host(raw: &str) -> Option<String> {
@@ -1649,7 +1721,10 @@ impl Default for LmStudioProvider {
                 normalized
             })
             .unwrap_or_else(|| "http://127.0.0.1:1234".to_string());
-        Self { base_url }
+        let api_key = std::env::var("LMSTUDIO_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
+        Self { base_url, api_key }
     }
 }
 
@@ -1673,12 +1748,16 @@ impl LmStudioProvider {
     /// Returns `(available, installed_models, count)`.
     pub fn detect_with_installed(&self) -> (bool, HashSet<String>, usize) {
         let mut set = HashSet::new();
-        let Ok(resp) = ureq::get(&self.models_url())
-            .config()
-            .timeout_global(Some(std::time::Duration::from_millis(800)))
-            .build()
-            .call()
-        else {
+        let Ok(resp) = ({
+            let mut req = ureq::get(&self.models_url())
+                .config()
+                .timeout_global(Some(std::time::Duration::from_millis(800)))
+                .build();
+            if let Some(ref key) = self.api_key {
+                req = req.header("Authorization", &format!("Bearer {}", key));
+            }
+            req.call()
+        }) else {
             return (false, set, 0);
         };
 
@@ -1747,12 +1826,14 @@ impl ModelProvider for LmStudioProvider {
     }
 
     fn is_available(&self) -> bool {
-        ureq::get(&self.models_url())
+        let mut req = ureq::get(&self.models_url())
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(2)))
-            .build()
-            .call()
-            .is_ok()
+            .build();
+        if let Some(ref key) = self.api_key {
+            req = req.header("Authorization", &format!("Bearer {}", key));
+        }
+        req.call().is_ok()
     }
 
     fn installed_models(&self) -> HashSet<String> {
@@ -1763,6 +1844,7 @@ impl ModelProvider for LmStudioProvider {
     fn start_pull(&self, model_tag: &str) -> Result<PullHandle, String> {
         let download_url = self.download_url();
         let models_url = self.models_url();
+        let api_key = self.api_key.clone();
         let tag = match lmstudio_pull_tag(model_tag) {
             Some(t) => t,
             None => {
@@ -1787,11 +1869,14 @@ impl ModelProvider for LmStudioProvider {
             // close the stream while the download proceeds in the background.
             // In the latter case we poll the installed models list to detect
             // eventual completion.
-            let resp = ureq::post(&download_url)
+            let mut req = ureq::post(&download_url)
                 .config()
                 .timeout_global(Some(std::time::Duration::from_secs(3600)))
-                .build()
-                .send_json(&body);
+                .build();
+            if let Some(ref key) = api_key {
+                req = req.header("Authorization", &format!("Bearer {}", key));
+            }
+            let resp = req.send_json(&body);
 
             match resp {
                 Ok(resp) => {
@@ -1898,12 +1983,14 @@ impl ModelProvider for LmStudioProvider {
                         for poll_num in 0..max_polls {
                             std::thread::sleep(poll_interval);
 
-                            let Ok(resp) = ureq::get(&models_url)
+                            let mut req = ureq::get(&models_url)
                                 .config()
                                 .timeout_global(Some(std::time::Duration::from_secs(5)))
-                                .build()
-                                .call()
-                            else {
+                                .build();
+                            if let Some(ref key) = api_key {
+                                req = req.header("Authorization", &format!("Bearer {}", key));
+                            }
+                            let Ok(resp) = req.call() else {
                                 continue;
                             };
 
@@ -2904,7 +2991,9 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     ("mistral-7b-instruct-v0.2", "mistral:7b"),
     ("mistral-nemo-instruct-2407", "mistral-nemo"),
     ("mistral-small-24b-instruct-2501", "mistral-small:24b"),
+    ("mistral-small-3.1-24b-instruct-2503", "mistral-small3.1"),
     ("mistral-large-instruct-2407", "mistral-large"),
+    ("devstral-small-2505", "devstral"),
     ("mixtral-8x7b-instruct-v0.1", "mixtral:8x7b"),
     ("mixtral-8x22b-instruct-v0.1", "mixtral:8x22b"),
     // Qwen 2 / 2.5
@@ -2924,8 +3013,10 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     ("qwen2.5-coder-7b-instruct", "qwen2.5-coder:7b"),
     ("qwen2.5-coder-1.5b-instruct", "qwen2.5-coder:1.5b"),
     ("qwen2.5-coder-0.5b-instruct", "qwen2.5-coder:0.5b"),
+    ("qwen2.5-vl-72b-instruct", "qwen2.5vl:72b"),
     ("qwen2.5-vl-7b-instruct", "qwen2.5vl:7b"),
     ("qwen2.5-vl-3b-instruct", "qwen2.5vl:3b"),
+    ("qwq-32b", "qwq"),
     // Qwen 3
     ("qwen3-235b-a22b", "qwen3:235b"),
     ("qwen3-32b", "qwen3:32b"),
@@ -2952,6 +3043,9 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     ("deepseek-r1-distill-qwen-32b", "deepseek-r1:32b"),
     ("deepseek-r1-distill-qwen-14b", "deepseek-r1:14b"),
     ("deepseek-r1-distill-qwen-7b", "deepseek-r1:7b"),
+    ("deepseek-r1-distill-qwen-1.5b", "deepseek-r1:1.5b"),
+    ("deepseek-r1-distill-llama-70b", "deepseek-r1:70b"),
+    ("deepseek-r1-distill-llama-8b", "deepseek-r1:8b"),
     ("deepseek-coder-v2-lite-instruct", "deepseek-coder-v2:16b"),
     // Community / other
     ("tinyllama-1.1b-chat-v1.0", "tinyllama"),
@@ -2963,6 +3057,8 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     ("falcon-7b-instruct", "falcon:7b"),
     ("falcon-40b-instruct", "falcon:40b"),
     ("falcon-180b-chat", "falcon:180b"),
+    ("falcon3-1b-instruct", "falcon3:1b"),
+    ("falcon3-3b-instruct", "falcon3:3b"),
     ("falcon3-7b-instruct", "falcon3:7b"),
     ("openchat-3.5-0106", "openchat:7b"),
     ("vicuna-7b-v1.5", "vicuna:7b"),
@@ -2971,6 +3067,8 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     ("solar-10.7b-instruct-v1.0", "solar:10.7b"),
     ("zephyr-7b-beta", "zephyr:7b"),
     ("c4ai-command-r-v01", "command-r"),
+    ("c4ai-command-r-plus-08-2024", "command-r-plus"),
+    ("c4ai-command-a-03-2025", "command-a"),
     (
         "nous-hermes-2-mixtral-8x7b-dpo",
         "nous-hermes2-mixtral:8x7b",
@@ -2978,6 +3076,7 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     ("hermes-3-llama-3.1-8b", "hermes3:8b"),
     ("nomic-embed-text-v1.5", "nomic-embed-text"),
     ("bge-large-en-v1.5", "bge-large"),
+    ("smollm2-1.7b-instruct", "smollm2:1.7b"),
     ("smollm2-135m-instruct", "smollm2:135m"),
     ("smollm2-135m", "smollm2:135m"),
     // Google Gemma 3n
@@ -2986,6 +3085,17 @@ const OLLAMA_MAPPINGS: &[(&str, &str)] = &[
     // Microsoft Phi-4 reasoning
     ("phi-4-reasoning", "phi4-reasoning"),
     ("phi-4-mini-reasoning", "phi4-mini-reasoning"),
+    // NVIDIA Nemotron
+    ("llama-3.1-nemotron-70b-instruct-hf", "nemotron:70b"),
+    ("llama-3.3-nemotron-super-49b-v1", "nemotron:49b"),
+    // EXAONE Deep reasoning
+    ("exaone-deep-2.4b", "exaone-deep:2.4b"),
+    ("exaone-deep-7.8b", "exaone-deep:7.8b"),
+    ("exaone-deep-32b", "exaone-deep:32b"),
+    // OLMo 2
+    ("olmo-2-1124-7b-instruct", "olmo2:7b"),
+    ("olmo-2-1124-13b-instruct", "olmo2:13b"),
+    ("olmo-2-0325-32b-instruct", "olmo2:32b"),
     // DeepSeek V3.2 Speciale (no local Ollama tag yet, maps to v3)
     ("deepseek-v3.2-speciale", "deepseek-v3"),
     // Liquid AI LFM2
@@ -3340,6 +3450,26 @@ mod tests {
         assert!(candidates.contains(&"qwen3".to_string()));
         // No slash, so repo == full name — no duplicate
         assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_lmstudio_api_key_filtering() {
+        // Test the api_key filtering logic without mutating the process
+        // environment. LmStudioProvider::default() applies
+        // `.filter(|k| !k.is_empty())` to the env var value.
+        fn filter_key(val: Option<&str>) -> Option<String> {
+            val.map(String::from).filter(|k| !k.is_empty())
+        }
+
+        // Missing env var → None
+        assert!(filter_key(None).is_none());
+        // Real value → Some
+        assert_eq!(
+            filter_key(Some("my-secret-key")),
+            Some("my-secret-key".to_string())
+        );
+        // Empty string → None (must not produce Some(""))
+        assert!(filter_key(Some("")).is_none());
     }
 
     #[test]
@@ -4331,28 +4461,21 @@ mod tests {
     }
 
     #[test]
-    fn test_docker_desktop_running_via_env_var() {
-        // Test 1: Non-empty value should detect Docker Desktop
-        unsafe {
-            std::env::set_var("DOCKER_MODEL_RUNNER_HOST", "localhost:12434");
+    fn test_docker_model_runner_host_filtering() {
+        // Test the DOCKER_MODEL_RUNNER_HOST filtering logic without mutating the
+        // process environment. is_docker_desktop_running() applies
+        // `!v.trim().is_empty()` to the env var value.
+        fn host_is_set(val: Option<&str>) -> bool {
+            val.map(|v| !v.trim().is_empty()).unwrap_or(false)
         }
-        assert!(is_docker_desktop_running());
 
-        // Test 2: Empty string should NOT count as running
-        unsafe {
-            std::env::set_var("DOCKER_MODEL_RUNNER_HOST", "");
-        }
-        assert!(!is_docker_desktop_running());
-
-        // Test 3: Whitespace-only should NOT count as running
-        unsafe {
-            std::env::set_var("DOCKER_MODEL_RUNNER_HOST", "   ");
-        }
-        assert!(!is_docker_desktop_running());
-
-        // Cleanup
-        unsafe {
-            std::env::remove_var("DOCKER_MODEL_RUNNER_HOST");
-        }
+        // Non-empty value should count as set
+        assert!(host_is_set(Some("localhost:12434")));
+        // Empty string should NOT count
+        assert!(!host_is_set(Some("")));
+        // Whitespace-only should NOT count
+        assert!(!host_is_set(Some("   ")));
+        // Missing env var should NOT count
+        assert!(!host_is_set(None));
     }
 }

@@ -6,7 +6,8 @@
 
 <p align="center">
   <b>English</b> ·
-  <a href="README.zh.md">中文</a>
+  <a href="README.zh.md">中文</a> ·
+  <a href="README.ja.md">日本語</a>
 </p>
 
 <p align="center">
@@ -49,6 +50,13 @@ If Scoop is not installed, follow the [Scoop installation guide](https://scoop.s
 ### macOS / Linux
 
 #### Homebrew
+
+Prebuilt binary (recommended, works on all macOS/Linux versions):
+```sh
+brew install AlexsJones/llmfit/llmfit
+```
+
+Or from the homebrew-core formula, which builds from source on macOS versions without a bottle:
 ```sh
 brew install llmfit
 ```
@@ -125,7 +133,7 @@ Launches the interactive terminal UI. Your system specs (CPU, RAM, GPU name, VRA
 | `V`                        | Enter Select mode (column-based filtering)                            |
 | `t`                        | Cycle color theme (saved automatically)                               |
 | `p`                        | Open Plan mode for selected model (hardware planning)                 |
-| `P`                        | Open provider filter popup                                            |
+| `P`                        | Open provider filter popup (type to fuzzy-filter providers)          |
 | `U`                        | Open use-case filter popup                                            |
 | `C`                        | Open capability filter popup                                          |
 | `L`                        | Open license filter popup                                             |
@@ -851,6 +859,15 @@ To connect to LM Studio on a different host or port, set the `LMSTUDIO_HOST` env
 
 ```sh
 LMSTUDIO_HOST="http://192.168.1.100:1234" llmfit
+```
+
+### API authentication
+
+If your LM Studio instance has **Require API Key** enabled (required for MCP server access), set the `LMSTUDIO_API_KEY` environment variable to provide a Bearer token with all requests:
+
+```sh
+export LMSTUDIO_API_KEY="your-api-key-here"
+llmfit
 ```
 
 ### Model name mapping

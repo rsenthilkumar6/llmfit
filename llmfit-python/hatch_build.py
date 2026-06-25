@@ -41,6 +41,7 @@ from packaging.tags import sys_tags
 TARGET_CONFIGS: dict[str, tuple[str, str]] = {
     "manylinux_2_17_x86_64": ("x86_64-unknown-linux-gnu", "llmfit"),
     "manylinux_2_17_aarch64": ("aarch64-unknown-linux-gnu", "llmfit"),
+    "manylinux_2_39_riscv64": ("riscv64gc-unknown-linux-gnu", "llmfit"),
     "musllinux_1_2_x86_64": ("x86_64-unknown-linux-musl", "llmfit"),
     "musllinux_1_2_aarch64": ("aarch64-unknown-linux-musl", "llmfit"),
     "macosx_10_12_x86_64": ("x86_64-apple-darwin", "llmfit"),

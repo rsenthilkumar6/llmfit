@@ -288,7 +288,10 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
             app.clear_search();
         }
 
-        KeyCode::Char(c) => app.search_input(c),
+        KeyCode::Left => app.search_cursor_left(),
+        KeyCode::Right => app.search_cursor_right(),
+
+        KeyCode::Char(c) if allows_search_text_input(key.modifiers) => app.search_input(c),
 
         // Allow navigation while searching
         KeyCode::Up => app.move_up(),
@@ -299,19 +302,61 @@ fn handle_search_mode(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_provider_popup_mode(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Esc | KeyCode::Char('P') | KeyCode::Char('q') => app.close_provider_popup(),
+        KeyCode::Esc => app.close_provider_popup(),
 
-        KeyCode::Up | KeyCode::Char('k') => app.provider_popup_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.provider_popup_down(),
+        KeyCode::Up if shift => app.provider_popup_up(25),
+        KeyCode::Down if shift => app.provider_popup_down(25),
+        KeyCode::Up => app.provider_popup_up(1),
+        KeyCode::Down => app.provider_popup_down(1),
 
-        KeyCode::Char(' ') | KeyCode::Enter => app.provider_popup_toggle(),
+        KeyCode::Left => app.provider_search_cursor_left(),
+        KeyCode::Right => app.provider_search_cursor_right(),
+        KeyCode::Home => app.provider_search_cursor_home(),
+        KeyCode::End => app.provider_search_cursor_end(),
 
-        KeyCode::Char('a') => app.provider_popup_select_all(),
-        KeyCode::Char('c') => app.provider_popup_clear_all(),
+        // Space toggles too (provider names never contain spaces).
+        KeyCode::Enter | KeyCode::Char(' ') => app.provider_popup_toggle(),
+
+        KeyCode::Backspace => app.provider_search_backspace(),
+        KeyCode::Delete => app.provider_search_delete(),
+
+        // Ctrl shortcuts (typing plain letters filters, so these are modified).
+        KeyCode::Char('u') if ctrl => app.provider_search_clear(),
+        KeyCode::Char('a') if ctrl => app.provider_popup_select_all(),
+        KeyCode::Char('n') if ctrl => app.provider_popup_clear_all(),
+
+        // Plain printable ASCII filters the provider list. Reject modified
+        // character events such as macOS Option/Command-arrow artifacts.
+        KeyCode::Char(c) if is_plain_provider_filter_char(c, key.modifiers) => {
+            app.provider_search_input(c)
+        }
 
         _ => {}
     }
+}
+
+fn allows_search_text_input(modifiers: KeyModifiers) -> bool {
+    !modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::HYPER
+            | KeyModifiers::META,
+    )
+}
+
+fn is_plain_provider_filter_char(c: char, modifiers: KeyModifiers) -> bool {
+    c.is_ascii_graphic()
+        && !modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::HYPER
+                | KeyModifiers::META,
+        )
 }
 
 fn handle_plan_mode(app: &mut App, key: KeyEvent) {
@@ -554,28 +599,22 @@ fn handle_download_manager_mode(app: &mut App, key: KeyEvent) {
                 app.dm_editing_dir = false;
             }
             KeyCode::Backspace => {
-                if app.dm_dir_cursor > 0 {
-                    app.dm_dir_cursor -= 1;
-                    app.dm_dir_input.remove(app.dm_dir_cursor);
-                }
+                app.dm_dir_backspace();
+            }
+            KeyCode::Delete => {
+                app.dm_dir_delete();
             }
             KeyCode::Left => {
-                if app.dm_dir_cursor > 0 {
-                    app.dm_dir_cursor -= 1;
-                }
+                app.dm_dir_cursor_left();
             }
             KeyCode::Right => {
-                if app.dm_dir_cursor < app.dm_dir_input.len() {
-                    app.dm_dir_cursor += 1;
-                }
+                app.dm_dir_cursor_right();
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.dm_dir_input.clear();
-                app.dm_dir_cursor = 0;
+                app.dm_dir_clear();
             }
             KeyCode::Char(c) => {
-                app.dm_dir_input.insert(app.dm_dir_cursor, c);
-                app.dm_dir_cursor += 1;
+                app.insert_dm_dir_char(c);
             }
             _ => {}
         }
@@ -686,5 +725,49 @@ fn handle_benchmarks_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r') => app.bench_refresh(),
         KeyCode::Char('H') => app.open_bench_hw_picker(),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_text_accepts_unmodified_and_shift_modified_input() {
+        assert!(allows_search_text_input(KeyModifiers::NONE));
+        assert!(allows_search_text_input(KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn search_text_rejects_modified_navigation_artifacts() {
+        assert!(!allows_search_text_input(KeyModifiers::ALT));
+        assert!(!allows_search_text_input(KeyModifiers::SUPER));
+        assert!(!allows_search_text_input(KeyModifiers::CONTROL));
+        assert!(!allows_search_text_input(KeyModifiers::META));
+        assert!(!allows_search_text_input(KeyModifiers::HYPER));
+        assert!(!allows_search_text_input(
+            KeyModifiers::ALT | KeyModifiers::SHIFT
+        ));
+        assert!(!allows_search_text_input(
+            KeyModifiers::SUPER | KeyModifiers::SHIFT
+        ));
+    }
+
+    #[test]
+    fn provider_filter_text_accepts_plain_ascii_graphic_chars() {
+        assert!(is_plain_provider_filter_char('o', KeyModifiers::NONE));
+        assert!(is_plain_provider_filter_char('O', KeyModifiers::SHIFT));
+        assert!(is_plain_provider_filter_char('-', KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn provider_filter_text_rejects_non_ascii_space_and_modified_chars() {
+        assert!(!is_plain_provider_filter_char('你', KeyModifiers::NONE));
+        assert!(!is_plain_provider_filter_char(' ', KeyModifiers::NONE));
+        assert!(!is_plain_provider_filter_char('b', KeyModifiers::ALT));
+        assert!(!is_plain_provider_filter_char('f', KeyModifiers::ALT));
+        assert!(!is_plain_provider_filter_char('a', KeyModifiers::SUPER));
+        assert!(!is_plain_provider_filter_char('e', KeyModifiers::SUPER));
+        assert!(!is_plain_provider_filter_char('x', KeyModifiers::CONTROL));
     }
 }

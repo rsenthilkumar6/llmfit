@@ -316,6 +316,7 @@ pub fn generation_quality_bonus(architecture: Option<&str>, name: &str) -> f64 {
 pub enum Capability {
     Vision,
     ToolUse,
+    Audio,
 }
 
 impl Capability {
@@ -323,11 +324,12 @@ impl Capability {
         match self {
             Capability::Vision => "Vision",
             Capability::ToolUse => "Tool Use",
+            Capability::Audio => "Audio",
         }
     }
 
     pub fn all() -> &'static [Capability] {
-        &[Capability::Vision, Capability::ToolUse]
+        &[Capability::Vision, Capability::ToolUse, Capability::Audio]
     }
 
     /// Infer capabilities from model metadata when not explicitly set in JSON.
@@ -364,6 +366,21 @@ impl Capability {
                 || (name.contains("gemma-4") && name.ends_with("-it")))
         {
             caps.push(Capability::ToolUse);
+        }
+
+        // Audio (speech-to-text) detection — Whisper / distil-whisper family.
+        // The scraper does not set capabilities=["audio"] for new ASR models,
+        // so infer it from the architecture / name / use_case the way Vision and
+        // ToolUse are inferred above.
+        let architecture = model.architecture.as_deref().unwrap_or("").to_lowercase();
+        if !caps.contains(&Capability::Audio)
+            && (architecture.contains("whisper")
+                || name.contains("whisper")
+                || use_case.contains("transcription")
+                || use_case.contains("speech")
+                || use_case.contains("audio"))
+        {
+            caps.push(Capability::Audio);
         }
 
         caps
@@ -631,10 +648,20 @@ impl std::fmt::Display for KvQuant {
 /// Returns true if a model's license matches any in the comma-separated filter string.
 /// Models without a license never match.
 pub fn matches_license_filter(license: &Option<String>, filter: &str) -> bool {
-    let allowed: Vec<String> = filter.split(',').map(|s| s.trim().to_lowercase()).collect();
+    let allowed: Vec<String> = filter
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     license
         .as_ref()
-        .map(|l| allowed.contains(&l.to_lowercase()))
+        .map(|licenses| {
+            licenses
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .any(|license| allowed.contains(&license))
+        })
         .unwrap_or(false)
 }
 
@@ -1412,6 +1439,17 @@ fn infer_heads_from_name(name: &str, params_b: f64) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_matches_license_filter_handles_comma_separated_model_licenses() {
+        let license = Some("apache-2.0,mit".to_string());
+
+        assert!(matches_license_filter(&license, "apache-2.0"));
+        assert!(matches_license_filter(&license, "mit"));
+        assert!(matches_license_filter(&license, "bsd-3-clause,mit"));
+        assert!(!matches_license_filter(&license, "cc-by-nc-4.0"));
+        assert!(!matches_license_filter(&None, "mit"));
+    }
 
     // ────────────────────────────────────────────────────────────────────
     // Quantization function tests
@@ -2879,5 +2917,35 @@ mod tests {
             has_gen,
             total_known_family
         );
+    }
+
+    #[test]
+    fn test_embedded_database_includes_whisper_audio_models() {
+        // Regression guard for PR #603: the audio/ASR entries must live in the
+        // *embedded* data file (llmfit-core/data/hf_models.json). Editing only
+        // the repo-root copy is a silent no-op because the binary embeds the
+        // core copy via include_str! — this test would catch that (whisper
+        // count: 0) at `cargo test` time.
+        let db = ModelDatabase::embedded();
+        let whisper: Vec<_> = db
+            .get_all_models()
+            .iter()
+            .filter(|m| m.name.to_lowercase().contains("whisper"))
+            .collect();
+
+        assert!(
+            !whisper.is_empty(),
+            "embedded database has no Whisper models — audio entries are \
+             missing from llmfit-core/data/hf_models.json"
+        );
+        // Each Whisper entry must carry the Audio capability (set explicitly in
+        // JSON and re-derived by Capability::infer).
+        for m in &whisper {
+            assert!(
+                m.capabilities.contains(&Capability::Audio),
+                "Whisper model {:?} is missing Capability::Audio",
+                m.name
+            );
+        }
     }
 }

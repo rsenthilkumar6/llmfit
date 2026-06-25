@@ -85,15 +85,26 @@ impl SystemSpecs {
         let gpus = Self::detect_all_gpus(total_ram_gb, &cpu_name);
 
         // Primary GPU = the one with the most VRAM (best for inference).
-        // For fit scoring, we use the primary GPU's VRAM pool.
+        // Per-card display values come from the primary; the fit-scoring pool
+        // and GPU count are aggregated across every detected GPU so that
+        // multi-GPU systems (including mixed models, e.g. RX 7600 + R9700)
+        // contribute their full combined VRAM, not just the primary's.
         let primary = gpus.first();
         let has_gpu = !gpus.is_empty();
         let gpu_vram_gb = primary.and_then(|g| g.vram_gb);
-        // Total VRAM = per-card VRAM * count (for multi-GPU tensor splitting)
-        let total_gpu_vram_gb = primary.and_then(|g| g.vram_gb.map(|vram| vram * g.count as f64));
         let gpu_name = primary.map(|g| g.name.clone());
-        let gpu_count = primary.map(|g| g.count).unwrap_or(0);
         let unified_memory = primary.map(|g| g.unified_memory).unwrap_or(false);
+        // Total VRAM = sum of per-card VRAM * count across all GPUs (for
+        // multi-GPU tensor splitting). Unified-memory GPUs report the shared
+        // system pool as their VRAM; with a single such GPU this is correct.
+        let total_gpu_vram_gb = {
+            let sum: f64 = gpus
+                .iter()
+                .filter_map(|g| g.vram_gb.map(|vram| vram * g.count as f64))
+                .sum();
+            if sum > 0.0 { Some(sum) } else { None }
+        };
+        let gpu_count: u32 = gpus.iter().map(|g| g.count).sum();
 
         let cpu_backend =
             if cfg!(target_arch = "aarch64") || cpu_name.to_lowercase().contains("apple") {
@@ -140,9 +151,7 @@ impl SystemSpecs {
         // AMD GPUs via rocm-smi or sysfs
         let amd_rocm = Self::detect_amd_gpu_rocm_info();
         if amd_rocm.is_empty() {
-            if let Some(amd) = Self::detect_amd_gpu_sysfs_info() {
-                gpus.push(amd);
-            }
+            gpus.extend(Self::detect_amd_gpu_sysfs_info());
         } else {
             gpus.extend(amd_rocm);
         }
@@ -570,13 +579,23 @@ impl SystemSpecs {
         Self::parse_rocm_smi_output(&vram_text, product_text.as_deref())
     }
 
-    /// Parse rocm-smi `--showmeminfo vram` and `--showproductname` output
-    /// into one `GpuInfo` per distinct GPU model. Identical models are
-    /// grouped with a `count` field, like `parse_nvidia_smi_list`.
-    fn parse_rocm_smi_output(vram_text: &str, product_text: Option<&str>) -> Vec<GpuInfo> {
-        // Parse per-GPU VRAM total.
-        // Typical format: "GPU[0] : VRAM Total Memory (B): 8589934592"
-        let mut per_gpu_vram_bytes: Vec<u64> = Vec::new();
+    /// Parse per-GPU VRAM totals (bytes) from `rocm-smi --showmeminfo vram`.
+    ///
+    /// Handles both output formats:
+    /// * Block (ROCm 5.x / 6.x default): one line per field, e.g.
+    ///   `GPU[0] : VRAM Total Memory (B): 8589934592`. The total line is
+    ///   matched by containing "total" and not "used".
+    /// * Tabular (newer rocm-smi): a header row followed by one row per
+    ///   device, e.g.
+    ///   `Device  Node  VRAM Total Memory (B)   VRAM Total Used Memory (B)`
+    ///   `0       2     34342961152             16893`.
+    ///   Device rows begin with the integer device index; the Total column
+    ///   precedes the Used column, so the first VRAM-sized number on the row
+    ///   is the total.
+    fn parse_rocm_vram_bytes(vram_text: &str) -> Vec<u64> {
+        let mut out: Vec<u64> = Vec::new();
+
+        // Block format.
         for line in vram_text.lines() {
             let lower = line.to_lowercase();
             if lower.contains("total") && !lower.contains("used") {
@@ -586,29 +605,112 @@ impl SystemSpecs {
                     .next_back()
                     && val > 0
                 {
-                    per_gpu_vram_bytes.push(val);
+                    out.push(val);
                 }
             }
         }
+        if !out.is_empty() {
+            return out;
+        }
 
-        // Parse per-GPU names from --showproductname.
-        // Format: "GPU[0] : Card Series: AMD Radeon RX 7600"
-        let per_gpu_names: Vec<String> = product_text
-            .map(|text| {
-                text.lines()
-                    .filter_map(|line| {
-                        let lower = line.to_lowercase();
-                        if lower.contains("card series") {
-                            line.rsplit(':')
-                                .next()
-                                .map(|n| n.trim().to_string())
-                                .filter(|n| !n.is_empty())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
+        // Tabular format fallback. A device row starts with the integer device
+        // index; pick the first number large enough to be a VRAM total (>= 64
+        // MB), which skips the device/node index columns and lands on the
+        // Total column before the Used column.
+        const MIN_VRAM_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
+        for line in vram_text.lines() {
+            let mut tokens = line.split_whitespace();
+            match tokens.next() {
+                Some(first) if first.parse::<u32>().is_ok() => {}
+                _ => continue, // not a device data row
+            }
+            if let Some(total) = line
+                .split_whitespace()
+                .filter_map(|w| w.parse::<u64>().ok())
+                .find(|&v| v >= MIN_VRAM_BYTES)
+            {
+                out.push(total);
+            }
+        }
+        out
+    }
+
+    /// Parse per-GPU product names from `rocm-smi --showproductname`.
+    ///
+    /// Handles both the block format (`GPU[0] : Card Series: AMD Radeon RX
+    /// 7600`) and the tabular format where `Card Series` is a column header
+    /// and each device row carries its model in that column. Returns one
+    /// name per device, in device order.
+    fn parse_rocm_product_names(text: &str) -> Vec<String> {
+        // Block format: name is after the last colon on a "Card Series" line,
+        // e.g. "GPU[0] : Card Series: AMD Radeon RX 7600". The colon guard
+        // avoids matching a tabular "Card Series" column header (no colon).
+        let block: Vec<String> = text
+            .lines()
+            .filter_map(|line| {
+                if line.to_lowercase().contains("card series") && line.contains(':') {
+                    line.rsplit(':')
+                        .next()
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                } else {
+                    None
+                }
             })
+            .collect();
+        if !block.is_empty() {
+            return block;
+        }
+
+        // Tabular format: slice the "Card Series" column out of each device
+        // row using the header column offsets. The column runs from the start
+        // of "Card Series" to the start of the next known column header.
+        let mut out: Vec<String> = Vec::new();
+        let Some(header) = text
+            .lines()
+            .find(|l| l.to_lowercase().contains("card series"))
+        else {
+            return out;
+        };
+        let header_lower = header.to_lowercase();
+        let Some(start) = header_lower.find("card series") else {
+            return out;
+        };
+        let end = ["card model", "card vendor", "card sku", "card partition"]
+            .iter()
+            .filter_map(|h| header_lower.find(h))
+            .filter(|&i| i > start)
+            .min()
+            .unwrap_or(header.len());
+
+        for line in text.lines() {
+            // Device rows start with the integer device index.
+            match line.split_whitespace().next() {
+                Some(first) if first.parse::<u32>().is_ok() => {}
+                _ => continue,
+            }
+            if line.len() <= start {
+                out.push("AMD GPU".to_string());
+                continue;
+            }
+            let slice_end = end.min(line.len());
+            let name = line[start..slice_end].trim().to_string();
+            out.push(if name.is_empty() {
+                "AMD GPU".to_string()
+            } else {
+                name
+            });
+        }
+        out
+    }
+
+    /// Parse rocm-smi `--showmeminfo vram` and `--showproductname` output
+    /// into one `GpuInfo` per distinct GPU model. Identical models are
+    /// grouped with a `count` field, like `parse_nvidia_smi_list`.
+    fn parse_rocm_smi_output(vram_text: &str, product_text: Option<&str>) -> Vec<GpuInfo> {
+        let per_gpu_vram_bytes = Self::parse_rocm_vram_bytes(vram_text);
+        let per_gpu_names = product_text
+            .map(Self::parse_rocm_product_names)
             .unwrap_or_default();
 
         // Filter out integrated GPUs (iGPUs) that have very little VRAM.
@@ -664,19 +766,30 @@ impl SystemSpecs {
             .collect()
     }
 
-    /// Detect AMD GPU via sysfs on Linux (works without ROCm installed).
-    /// AMD vendor ID is 0x1002.
-    fn detect_amd_gpu_sysfs_info() -> Option<GpuInfo> {
+    /// Detect AMD GPUs via sysfs on Linux (works without ROCm installed).
+    /// AMD vendor ID is 0x1002. Enumerates every `cardN` entry in
+    /// `/sys/class/drm`, groups identical models with a `count` (like the
+    /// ROCm and NVIDIA paths), and returns one `GpuInfo` per distinct model
+    /// so multi-GPU setups are reported in full.
+    fn detect_amd_gpu_sysfs_info() -> Vec<GpuInfo> {
         if !cfg!(target_os = "linux") {
-            return None;
+            return Vec::new();
         }
 
-        let mut slot_hints: Vec<String> = Vec::new();
-        let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+        let entries = match std::fs::read_dir("/sys/class/drm") {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+
+        // Collect per-card (name, vram) pairs.
+        let mut cards: Vec<(String, Option<f64>)> = Vec::new();
 
         for entry in entries.flatten() {
             let card_path = entry.path();
-            let fname = card_path.file_name()?.to_str()?.to_string();
+            let fname = match card_path.file_name().and_then(|f| f.to_str()) {
+                Some(f) => f.to_string(),
+                None => continue,
+            };
             // Only look at cardN entries, not cardN-DP-1 etc.
             if !fname.starts_with("card") || fname.contains('-') {
                 continue;
@@ -684,12 +797,9 @@ impl SystemSpecs {
 
             let device_path = card_path.join("device");
             let vendor_path = device_path.join("vendor");
-            if let Ok(vendor) = std::fs::read_to_string(&vendor_path) {
-                if vendor.trim() != "0x1002" {
-                    continue;
-                }
-            } else {
-                continue;
+            match std::fs::read_to_string(&vendor_path) {
+                Ok(vendor) if vendor.trim() == "0x1002" => {}
+                _ => continue,
             }
 
             // Found an AMD GPU. Try to read VRAM.
@@ -702,6 +812,8 @@ impl SystemSpecs {
                 vram_gb = Some(vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
             }
 
+            // Resolve this card's PCI slot so lspci yields a per-card name.
+            let mut slot_hints: Vec<String> = Vec::new();
             if let Ok(uevent) = std::fs::read_to_string(device_path.join("uevent")) {
                 for line in uevent.lines() {
                     if let Some(slot) = line.strip_prefix("PCI_SLOT_NAME=") {
@@ -722,16 +834,42 @@ impl SystemSpecs {
                 }
             }
 
-            // AMD GPU without ROCm — Vulkan is the most likely inference backend
-            return Some(GpuInfo {
-                name,
-                vram_gb,
-                backend: GpuBackend::Vulkan,
-                count: 1,
-                unified_memory: false,
+            cards.push((name, vram_gb));
+        }
+
+        // Group identical models, tracking count and max per-card VRAM.
+        let mut grouped: BTreeMap<String, (u32, Option<f64>)> = BTreeMap::new();
+        for (name, vram_gb) in cards {
+            let entry = grouped.entry(name).or_insert((0, None));
+            entry.0 += 1;
+            match (entry.1, vram_gb) {
+                (Some(existing), Some(new)) if new > existing => entry.1 = Some(new),
+                (None, Some(_)) => entry.1 = vram_gb,
+                _ => {}
+            }
+        }
+
+        // Filter out integrated GPUs when discrete GPUs are present.
+        let has_discrete = grouped.iter().any(|(name, (_, vram))| {
+            !Self::is_integrated_gpu_name(name) && vram.unwrap_or(0.0) > 2.0
+        });
+        if has_discrete {
+            grouped.retain(|name, (_, vram)| {
+                !Self::is_integrated_gpu_name(name) && vram.unwrap_or(0.0) > 2.0
             });
         }
-        None
+
+        grouped
+            .into_iter()
+            .map(|(name, (count, vram_gb))| GpuInfo {
+                name,
+                // AMD GPU without ROCm — Vulkan is the most likely backend
+                vram_gb,
+                backend: GpuBackend::Vulkan,
+                count,
+                unified_memory: false,
+            })
+            .collect()
     }
 
     /// Extract AMD GPU name from lspci output.
@@ -3444,5 +3582,74 @@ GPU[0]          : VRAM Total Used Memory (B): 200000";
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].name, "AMD GPU");
         assert!(gpus[0].vram_gb.unwrap() > 31.0);
+    }
+
+    // Newer rocm-smi emits a tabular layout instead of one line per field.
+    // Models the dual Instinct MI50 setup from issue #638 (both cards share
+    // the same product name and 32 GB VRAM), which the block-only parser
+    // collapsed to a single card.
+    #[test]
+    fn test_parse_rocm_smi_tabular_identical_gpus() {
+        let vram_text = "\
+====================== ROCm System Management Interface ======================
+================================ Memory Usage ================================
+Device  Node  VRAM Total Memory (B)   VRAM Total Used Memory (B)
+0       2     34342961152             16893952
+1       1     34342961152             33678336
+=============================================================================";
+
+        let product_text = "\
+====================== ROCm System Management Interface ======================
+================================ Product Info ================================
+Device  Card Series            Card Model  Card Vendor
+0       Instinct MI60 / MI50   0x66a1      Advanced Micro Devices, Inc. [AMD/ATI]
+1       Instinct MI60 / MI50   0x66a1      Advanced Micro Devices, Inc. [AMD/ATI]
+=============================================================================";
+
+        let gpus = SystemSpecs::parse_rocm_smi_output(vram_text, Some(product_text));
+
+        assert_eq!(gpus.len(), 1, "identical tabular GPUs should be grouped");
+        assert_eq!(gpus[0].count, 2, "both MI50s should be detected");
+        assert!(gpus[0].name.contains("MI50"), "name: {}", gpus[0].name);
+        assert!(gpus[0].vram_gb.unwrap() > 31.0 && gpus[0].vram_gb.unwrap() < 33.0);
+    }
+
+    #[test]
+    fn test_parse_rocm_smi_tabular_two_different_gpus() {
+        let vram_text = "\
+Device  Node  VRAM Total Memory (B)   VRAM Total Used Memory (B)
+0       2     8573157376              60448768
+1       1     34208743424             33732509696";
+
+        let product_text = "\
+Device  Card Series              Card Model
+0       AMD Radeon RX 7600       0x7480
+1       AMD Radeon AI PRO R9700  0x7551";
+
+        let gpus = SystemSpecs::parse_rocm_smi_output(vram_text, Some(product_text));
+
+        assert_eq!(gpus.len(), 2, "should detect two distinct tabular GPUs");
+        let rx7600 = gpus.iter().find(|g| g.name.contains("RX 7600")).unwrap();
+        let r9700 = gpus.iter().find(|g| g.name.contains("R9700")).unwrap();
+        assert_eq!(rx7600.count, 1);
+        assert_eq!(r9700.count, 1);
+        assert!(rx7600.vram_gb.unwrap() > 7.0 && rx7600.vram_gb.unwrap() < 9.0);
+        assert!(r9700.vram_gb.unwrap() > 31.0 && r9700.vram_gb.unwrap() < 33.0);
+    }
+
+    // Tabular VRAM without parseable product names still yields the right
+    // count (names fall back to "AMD GPU" but cards are not lost).
+    #[test]
+    fn test_parse_rocm_smi_tabular_vram_no_names() {
+        let vram_text = "\
+Device  Node  VRAM Total Memory (B)   VRAM Total Used Memory (B)
+0       2     34342961152             16893952
+1       1     34342961152             33678336";
+
+        let gpus = SystemSpecs::parse_rocm_smi_output(vram_text, None);
+
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].count, 2);
+        assert_eq!(gpus[0].name, "AMD GPU");
     }
 }
