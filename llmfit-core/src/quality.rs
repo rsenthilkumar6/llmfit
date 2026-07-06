@@ -354,10 +354,10 @@ where
 
     for (role_name, role_def) in &config.roles {
         // Skip roles not in the filter (if a filter is set)
-        if let Some(filter) = role_filter {
-            if !filter.iter().any(|f| f == role_name) {
-                continue;
-            }
+        if let Some(filter) = role_filter
+            && !filter.iter().any(|f| f == role_name)
+        {
+            continue;
         }
 
         let mut role_results = Vec::new();

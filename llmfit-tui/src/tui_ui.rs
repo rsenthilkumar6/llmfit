@@ -777,7 +777,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
         Constraint::Length(10), // quant (AWQ-4bit, GPTQ-Int4, GPTQ-Int8)
         Constraint::Length(7),  // mode
         Constraint::Length(6),  // mem %
-        Constraint::Length(5),  // ctx
+        Constraint::Length(10), // ctx ("262k→14k" when memory-constrained)
         Constraint::Length(8),  // date (YYYY-MM)
         Constraint::Length(10), // fit
         Constraint::Min(10),    // use case
@@ -907,8 +907,13 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
                 Cell::from(fit.run_mode_text().to_string()).style(Style::default().fg(mode_color)),
                 Cell::from(format!("{:.0}%", fit.utilization_pct))
                     .style(Style::default().fg(color)),
-                Cell::from(format!("{}k", fit.model.context_length / 1000))
-                    .style(Style::default().fg(tc.muted)),
+                Cell::from(fit.context_display()).style(Style::default().fg(
+                    if fit.context_severely_limited() {
+                        tc.warning
+                    } else {
+                        tc.muted
+                    },
+                )),
                 Cell::from(
                     fit.model
                         .release_date
@@ -937,7 +942,7 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
         Constraint::Length(6),  // disk
         Constraint::Length(7),  // mode
         Constraint::Length(7),  // mem %
-        Constraint::Length(5),  // ctx
+        Constraint::Length(10), // ctx ("262k→14k" when memory-constrained)
         Constraint::Length(8),  // date (YYYY-MM)
         Constraint::Length(10), // fit
         Constraint::Min(10),    // use case
@@ -4963,204 +4968,196 @@ fn draw_bench(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             }
 
             // ── Detail pane (when open) ──
-            if let Some(det_area) = detail_area {
-                if let Some(ms) = app.bench_model_status.get(app.bench_selected_row) {
-                    let result = app.bench_results.iter().find(|r| r.model == ms.name);
+            if let Some(det_area) = detail_area
+                && let Some(ms) = app.bench_model_status.get(app.bench_selected_row)
+            {
+                let result = app.bench_results.iter().find(|r| r.model == ms.name);
 
-                    let mut detail_lines: Vec<Line> = Vec::new();
+                let mut detail_lines: Vec<Line> = Vec::new();
 
-                    if let Some(result) = result {
+                if let Some(result) = result {
+                    detail_lines.push(Line::from(vec![
+                        Span::styled("  Model: ", Style::default().fg(tc.muted)),
+                        Span::styled(
+                            &result.model,
+                            Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    detail_lines.push(Line::from(Span::styled(
+                        format!(
+                            "  Overall: Q:{:.1}  S:{:.1} t/s  C:{:.1}  |  Tests: {}  Roles: {}",
+                            result.overall_quality,
+                            result.overall_speed,
+                            result.overall_composite,
+                            result.test_results.len(),
+                            result.roles.len()
+                        ),
+                        Style::default().fg(tc.fg),
+                    )));
+                    detail_lines.push(Line::from(""));
+
+                    // ── Role summary table ──
+                    let bold_style = Style::default().fg(tc.fg).add_modifier(Modifier::BOLD);
+                    detail_lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(format!("{:<16}", "Role"), bold_style),
+                        Span::styled(format!("{:>5}", "Qual"), bold_style),
+                        Span::styled(format!("{:>9}", "Speed"), bold_style),
+                        Span::styled(format!("{:>7}", "Comp"), bold_style),
+                        Span::styled(format!("{:>8}", "TTFT"), bold_style),
+                        Span::styled("  Bar", bold_style),
+                    ]));
+                    detail_lines.push(Line::from(Span::styled(
+                        format!("  {}", "─".repeat(60)),
+                        Style::default().fg(tc.border),
+                    )));
+
+                    for rs in &result.roles {
+                        let q_color = bench_score_color(rs.quality, tc);
+                        let c_color = bench_score_color(rs.composite, tc);
+                        let bar = bench_bar(rs.composite, 15);
+
+                        let role_tests: Vec<&llmfit_core::quality::QualityResult> = result
+                            .test_results
+                            .iter()
+                            .filter(|t| t.role == rs.role)
+                            .collect();
+                        let avg_ttft = if role_tests.is_empty() {
+                            0.0
+                        } else {
+                            role_tests.iter().filter_map(|t| t.ttft_ms).sum::<f64>()
+                                / role_tests
+                                    .iter()
+                                    .filter(|t| t.ttft_ms.is_some())
+                                    .count()
+                                    .max(1) as f64
+                        };
+
                         detail_lines.push(Line::from(vec![
-                            Span::styled("  Model: ", Style::default().fg(tc.muted)),
+                            Span::styled(format!("  {:<16}", rs.role), Style::default().fg(tc.fg)),
                             Span::styled(
-                                &result.model,
-                                Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                                format!("{:>5.1}", rs.quality),
+                                Style::default().fg(q_color),
                             ),
+                            Span::styled(
+                                format!("{:>7.1}t/s", rs.speed),
+                                Style::default().fg(tc.accent_secondary),
+                            ),
+                            Span::styled(
+                                format!("{:>7.1}", rs.composite),
+                                Style::default().fg(c_color),
+                            ),
+                            Span::styled(
+                                if avg_ttft > 0.0 {
+                                    format!("{:>6.0}ms", avg_ttft)
+                                } else {
+                                    format!("{:>8}", "—")
+                                },
+                                Style::default().fg(tc.muted),
+                            ),
+                            Span::styled(format!("  {}", bar), Style::default().fg(c_color)),
                         ]));
+                    }
+
+                    // ── Full test rubric grouped by role ──
+                    if !result.test_results.is_empty() {
+                        detail_lines.push(Line::from(""));
                         detail_lines.push(Line::from(Span::styled(
-                            format!(
-                                "  Overall: Q:{:.1}  S:{:.1} t/s  C:{:.1}  |  Tests: {}  Roles: {}",
-                                result.overall_quality,
-                                result.overall_speed,
-                                result.overall_composite,
-                                result.test_results.len(),
-                                result.roles.len()
-                            ),
-                            Style::default().fg(tc.fg),
+                            "  ── Full Test Rubric ──",
+                            Style::default().fg(tc.title).add_modifier(Modifier::BOLD),
                         )));
                         detail_lines.push(Line::from(""));
 
-                        // ── Role summary table ──
-                        let bold_style = Style::default().fg(tc.fg).add_modifier(Modifier::BOLD);
-                        detail_lines.push(Line::from(vec![
-                            Span::styled("  ", Style::default()),
-                            Span::styled(format!("{:<16}", "Role"), bold_style),
-                            Span::styled(format!("{:>5}", "Qual"), bold_style),
-                            Span::styled(format!("{:>9}", "Speed"), bold_style),
-                            Span::styled(format!("{:>7}", "Comp"), bold_style),
-                            Span::styled(format!("{:>8}", "TTFT"), bold_style),
-                            Span::styled("  Bar", bold_style),
-                        ]));
-                        detail_lines.push(Line::from(Span::styled(
-                            format!("  {}", "─".repeat(60)),
-                            Style::default().fg(tc.border),
-                        )));
+                        let mut current_role = String::new();
+                        for t in &result.test_results {
+                            if t.role != current_role {
+                                if !current_role.is_empty() {
+                                    detail_lines.push(Line::from(Span::styled(
+                                        "  └────────────────────────────────────────────────",
+                                        Style::default().fg(tc.border),
+                                    )));
+                                }
+                                current_role = t.role.clone();
+                                detail_lines.push(Line::from(vec![
+                                    Span::styled(
+                                        format!("  ┌─ {} ", t.role.to_uppercase()),
+                                        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::styled("─".repeat(50), Style::default().fg(tc.border)),
+                                ]));
+                            }
 
-                        for rs in &result.roles {
-                            let q_color = bench_score_color(rs.quality, tc);
-                            let c_color = bench_score_color(rs.composite, tc);
-                            let bar = bench_bar(rs.composite, 15);
-
-                            let role_tests: Vec<&llmfit_core::quality::QualityResult> = result
-                                .test_results
-                                .iter()
-                                .filter(|t| t.role == rs.role)
-                                .collect();
-                            let avg_ttft = if role_tests.is_empty() {
-                                0.0
+                            let q_color = bench_score_color(t.quality, tc);
+                            let status = if t.error.is_some() {
+                                "ERR"
+                            } else if t.quality >= 7.0 {
+                                " ✓ "
+                            } else if t.quality >= 4.0 {
+                                " ~ "
                             } else {
-                                role_tests.iter().filter_map(|t| t.ttft_ms).sum::<f64>()
-                                    / role_tests
-                                        .iter()
-                                        .filter(|t| t.ttft_ms.is_some())
-                                        .count()
-                                        .max(1) as f64
+                                " ✗ "
+                            };
+                            let status_color = if t.error.is_some() {
+                                tc.error
+                            } else if t.quality >= 7.0 {
+                                tc.good
+                            } else if t.quality >= 4.0 {
+                                tc.warning
+                            } else {
+                                tc.error
                             };
 
                             detail_lines.push(Line::from(vec![
                                 Span::styled(
-                                    format!("  {:<16}", rs.role),
+                                    format!("  │  {:<28}", t.test_name),
                                     Style::default().fg(tc.fg),
                                 ),
+                                Span::styled(status, Style::default().fg(status_color)),
                                 Span::styled(
-                                    format!("{:>5.1}", rs.quality),
+                                    format!("  Q:{:>4.1}", t.quality),
                                     Style::default().fg(q_color),
                                 ),
                                 Span::styled(
-                                    format!("{:>7.1}t/s", rs.speed),
-                                    Style::default().fg(tc.accent_secondary),
-                                ),
-                                Span::styled(
-                                    format!("{:>7.1}", rs.composite),
-                                    Style::default().fg(c_color),
-                                ),
-                                Span::styled(
-                                    if avg_ttft > 0.0 {
-                                        format!("{:>6.0}ms", avg_ttft)
-                                    } else {
-                                        format!("{:>8}", "—")
-                                    },
+                                    format!("  {:>6.1}t/s", t.tok_per_sec),
                                     Style::default().fg(tc.muted),
                                 ),
-                                Span::styled(format!("  {}", bar), Style::default().fg(c_color)),
+                                Span::styled(
+                                    format!("  {:>5.1}s", t.wall_time_sec),
+                                    Style::default().fg(tc.muted),
+                                ),
                             ]));
-                        }
 
-                        // ── Full test rubric grouped by role ──
-                        if !result.test_results.is_empty() {
-                            detail_lines.push(Line::from(""));
-                            detail_lines.push(Line::from(Span::styled(
-                                "  ── Full Test Rubric ──",
-                                Style::default().fg(tc.title).add_modifier(Modifier::BOLD),
-                            )));
-                            detail_lines.push(Line::from(""));
-
-                            let mut current_role = String::new();
-                            for t in &result.test_results {
-                                if t.role != current_role {
-                                    if !current_role.is_empty() {
-                                        detail_lines.push(Line::from(Span::styled(
-                                            "  └────────────────────────────────────────────────",
-                                            Style::default().fg(tc.border),
-                                        )));
-                                    }
-                                    current_role = t.role.clone();
-                                    detail_lines.push(Line::from(vec![
-                                        Span::styled(
-                                            format!("  ┌─ {} ", t.role.to_uppercase()),
-                                            Style::default()
-                                                .fg(tc.accent)
-                                                .add_modifier(Modifier::BOLD),
-                                        ),
-                                        Span::styled(
-                                            "─".repeat(50),
-                                            Style::default().fg(tc.border),
-                                        ),
-                                    ]));
-                                }
-
-                                let q_color = bench_score_color(t.quality, tc);
-                                let status = if t.error.is_some() {
-                                    "ERR"
-                                } else if t.quality >= 7.0 {
-                                    " ✓ "
-                                } else if t.quality >= 4.0 {
-                                    " ~ "
-                                } else {
-                                    " ✗ "
-                                };
-                                let status_color = if t.error.is_some() {
-                                    tc.error
-                                } else if t.quality >= 7.0 {
-                                    tc.good
-                                } else if t.quality >= 4.0 {
-                                    tc.warning
-                                } else {
-                                    tc.error
-                                };
-
-                                detail_lines.push(Line::from(vec![
-                                    Span::styled(
-                                        format!("  │  {:<28}", t.test_name),
-                                        Style::default().fg(tc.fg),
-                                    ),
-                                    Span::styled(status, Style::default().fg(status_color)),
-                                    Span::styled(
-                                        format!("  Q:{:>4.1}", t.quality),
-                                        Style::default().fg(q_color),
-                                    ),
-                                    Span::styled(
-                                        format!("  {:>6.1}t/s", t.tok_per_sec),
-                                        Style::default().fg(tc.muted),
-                                    ),
-                                    Span::styled(
-                                        format!("  {:>5.1}s", t.wall_time_sec),
-                                        Style::default().fg(tc.muted),
-                                    ),
-                                ]));
-
-                                if let Some(e) = &t.error {
-                                    detail_lines.push(Line::from(Span::styled(
-                                        format!("  │      Error: {}", e),
-                                        Style::default().fg(tc.error),
-                                    )));
-                                } else if !t.response_preview.is_empty() {
-                                    detail_lines.push(Line::from(Span::styled(
-                                        format!("  │      Preview: {}…", &t.response_preview),
-                                        Style::default().fg(tc.muted),
-                                    )));
-                                }
-                            }
-                            if !result.test_results.is_empty() {
+                            if let Some(e) = &t.error {
                                 detail_lines.push(Line::from(Span::styled(
-                                    "  └────────────────────────────────────────────────",
-                                    Style::default().fg(tc.border),
+                                    format!("  │      Error: {}", e),
+                                    Style::default().fg(tc.error),
+                                )));
+                            } else if !t.response_preview.is_empty() {
+                                detail_lines.push(Line::from(Span::styled(
+                                    format!("  │      Preview: {}…", &t.response_preview),
+                                    Style::default().fg(tc.muted),
                                 )));
                             }
                         }
-                    } else {
-                        detail_lines.push(Line::from(Span::styled(
-                            format!("  {} — pending or no results yet.", ms.name),
-                            Style::default().fg(tc.muted),
-                        )));
+                        if !result.test_results.is_empty() {
+                            detail_lines.push(Line::from(Span::styled(
+                                "  └────────────────────────────────────────────────",
+                                Style::default().fg(tc.border),
+                            )));
+                        }
                     }
-
-                    let scroll = app.live_bench_scroll as u16;
-                    let paragraph = Paragraph::new(detail_lines)
-                        .scroll((scroll, 0))
-                        .wrap(Wrap { trim: false });
-                    frame.render_widget(paragraph, det_area);
+                } else {
+                    detail_lines.push(Line::from(Span::styled(
+                        format!("  {} — pending or no results yet.", ms.name),
+                        Style::default().fg(tc.muted),
+                    )));
                 }
+
+                let scroll = app.live_bench_scroll as u16;
+                let paragraph = Paragraph::new(detail_lines)
+                    .scroll((scroll, 0))
+                    .wrap(Wrap { trim: false });
+                frame.render_widget(paragraph, det_area);
             }
         }
 

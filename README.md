@@ -99,6 +99,10 @@ This prints JSON from `llmfit recommend` command. The JSON could be further quer
 ```
 podman run ghcr.io/alexsjones/llmfit recommend --use-case coding | jq '.models[].name'
 ```
+To launch the interactive TUI instead, pass the global `--tui` flag:
+```sh
+docker run --rm -it ghcr.io/alexsjones/llmfit --tui
+```
 
 ### From source
 ```sh
@@ -434,6 +438,10 @@ llmfit fit --perfect -n 5
 # Show detected system specs
 llmfit system
 
+# Hardware diagnostic report for bug reports (raw nvidia-smi/rocm-smi/sysfs
+# output + what llmfit detected) — paste into a GitHub issue
+llmfit doctor
+
 # List all models in the database
 llmfit list
 
@@ -577,7 +585,7 @@ llmfit plan "Qwen/Qwen2.5-Coder-0.5B-Instruct" --context 8192 --json
    - **Ascend** -- Detected via `npu-smi`.
    - **Backend detection** -- Automatically identifies the acceleration backend (CUDA, Metal, ROCm, SYCL, CPU ARM, CPU x86, Ascend) for speed estimation.
 
-2. **Model database** -- Hundreds models sourced from the HuggingFace API, stored in `data/hf_models.json` and embedded at compile time. Memory requirements are computed from parameter counts across a quantization hierarchy (Q8_0 through Q2_K). VRAM is the primary constraint for GPU inference; system RAM is the fallback for CPU-only execution.
+2. **Model database** -- Hundreds models sourced from the HuggingFace API, stored in `llmfit-core/data/hf_models.json` and embedded at compile time. Memory requirements are computed from parameter counts across a quantization hierarchy (Q8_0 through Q2_K). VRAM is the primary constraint for GPU inference; system RAM is the fallback for CPU-only execution.
 
    **MoE support** -- Models with Mixture-of-Experts architectures (Mixtral, DeepSeek-V2/V3) are detected automatically. Only a subset of experts is active per token, so the effective VRAM requirement is much lower than total parameter count suggests. For example, Mixtral 8x7B has 46.7B total parameters but only activates ~12.9B per token, reducing VRAM from 23.9 GB to ~6.6 GB with expert offloading.
 
@@ -593,6 +601,8 @@ llmfit plan "Qwen/Qwen2.5-Coder-0.5B-Instruct" --context 8192 --json
    | **Context** | Context window capability vs target for the use case                           |
 
    Dimensions are combined into a weighted composite score. Weights vary by use-case category (General, Coding, Reasoning, Chat, Multimodal, Embedding). For example, Chat weights Speed higher (0.35) while Reasoning weights Quality higher (0.55). Models are ranked by composite score, with unrunnable models (Too Tight) always at the bottom.
+
+   Task alignment within the Quality dimension uses a curated per-family benchmark table ([llmfit-core/data/use_case_benchmarks.json](llmfit-core/data/use_case_benchmarks.json), aggregated from public coding/reasoning/chat leaderboards), so a strong coding model outranks a larger generalist for `--use-case coding` even at fewer parameters. Families without an entry fall back to name-based heuristics; corrections to the table are welcome PRs.
 
 5. **Speed estimation** -- Token generation in LLM inference is memory-bandwidth-bound: each token requires reading the full model weights once from VRAM. When the GPU model is recognized, llmfit uses its actual memory bandwidth to estimate throughput:
 
@@ -656,7 +666,7 @@ python3 scripts/scrape_hf_models.py
 cargo build --release
 ```
 
-The scraper writes `data/hf_models.json`, which is baked into the binary via `include_str!`. The automated update script backs up existing data, validates JSON output, and rebuilds the binary.
+The scraper writes `llmfit-core/data/hf_models.json`, which is baked into the binary via `include_str!`. The automated update script backs up existing data, validates JSON output, and rebuilds the binary.
 
 By default, the scraper enriches models with known GGUF download sources from providers like [unsloth](https://huggingface.co/unsloth) and [bartowski](https://huggingface.co/bartowski). Results are cached in `data/gguf_sources_cache.json` (7-day TTL) to avoid repeated API calls. Use `--no-gguf-sources` to skip enrichment for a faster scrape.
 
@@ -675,8 +685,8 @@ src/
   tui_app.rs      -- TUI application state, filters, navigation
   tui_ui.rs       -- TUI rendering (ratatui)
   tui_events.rs   -- TUI keyboard event handling (crossterm)
-data/
-  hf_models.json  -- Model database (206 models)
+llmfit-core/data/
+  hf_models.json  -- Model database (embedded at compile time)
 skills/
   llmfit-advisor/ -- OpenClaw skill for hardware-aware model recommendations
 scripts/
@@ -712,7 +722,7 @@ curl -sL https://opensource.org/license/MIT -o LICENSE
 # Or write your own. The Cargo.toml declares license = "MIT".
 ```
 
-- `data/hf_models.json` is committed. It is embedded at compile time and must be present in the published crate.
+- `llmfit-core/data/hf_models.json` is committed. It is embedded at compile time and must be present in the published crate.
 
 To publish updates:
 
@@ -924,7 +934,35 @@ Please run `cargo fmt` before pushing your changes. Most CI check failures are c
 cargo fmt
 ```
 
-### Adding a model
+### Adding your own models locally (no rebuild needed)
+
+You don't need to modify llmfit or wait for a release to see extra models. Create a `custom_models.json` in llmfit's data directory:
+
+- Linux: `~/.local/share/llmfit/custom_models.json`
+- macOS: `~/Library/Application Support/llmfit/custom_models.json`
+- Windows: `%APPDATA%\llmfit\custom_models.json`
+
+(or point the `LLMFIT_CUSTOM_MODELS` env var at any path). The file is a JSON array using the same entry format as the built-in catalog — see [llmfit-core/data/schema.json](llmfit-core/data/schema.json); only a few fields are required:
+
+```json
+[
+  {
+    "name": "my-org/My-Model-7B",
+    "provider": "my-org",
+    "parameter_count": "7B",
+    "min_ram_gb": 5.0,
+    "recommended_ram_gb": 8.0,
+    "min_vram_gb": 5.0,
+    "quantization": "Q4_K_M",
+    "context_length": 32768,
+    "use_case": "General chat"
+  }
+]
+```
+
+Custom entries with the same name as a catalog model **override** it; new names are added. Optional fields (`is_moe`, `num_hidden_layers`, `gguf_sources`, …) improve estimate accuracy when provided. You can also run `llmfit update` to fetch trending models from HuggingFace without a rebuild.
+
+### Adding a model to the built-in catalog
 
 1. Add the model's HuggingFace repo ID (e.g., `meta-llama/Llama-3.1-8B`) to the `TARGET_MODELS` list in `scripts/scrape_hf_models.py`.
 2. If the model is gated (requires HuggingFace authentication to access metadata), add a fallback entry to the `FALLBACKS` list in the same script with the parameter count and context length.
@@ -979,6 +1017,18 @@ See [skills/llmfit-advisor/SKILL.md](skills/llmfit-advisor/SKILL.md) for the ful
 ## Alternatives
 
 If you're looking for a different approach, check out [llm-checker](https://github.com/Pavelevich/llm-checker) -- a Node.js CLI tool with Ollama integration that can pull and benchmark models directly. It takes a more hands-on approach by actually running models on your hardware via Ollama, rather than estimating from specs. Good if you already have Ollama installed and want to test real-world performance. Note that it doesn't support MoE (Mixture-of-Experts) architectures -- all models are treated as dense, so memory estimates for models like Mixtral or DeepSeek-V3 will reflect total parameter count rather than the smaller active subset.
+
+---
+
+## Code signing
+
+llmfit's Windows release binaries are digitally signed (Authenticode) via [SignPath.io](https://about.signpath.io/), with a free code signing certificate provided by the [SignPath Foundation](https://signpath.org/).
+
+Signing happens automatically in the [release pipeline](.github/workflows/release.yml): only artifacts built by GitHub Actions from this repository are submitted for signing, and signing requests are approved by the project maintainer ([@AlexsJones](https://github.com/AlexsJones)).
+
+**Code signing policy:** see the [SignPath Foundation code signing policy and terms](https://signpath.org/terms).
+
+**Privacy:** this program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. llmfit only contacts external services when you explicitly use the corresponding feature (e.g. model downloads, runtime provider queries, or the community leaderboard).
 
 ---
 

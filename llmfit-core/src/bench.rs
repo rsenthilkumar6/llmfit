@@ -362,13 +362,12 @@ pub fn auto_detect_target(model_hint: Option<&str>) -> Result<BenchTarget, Strin
         .build()
         .call()
         .is_ok()
+        && let Ok(model_name) = detect_ollama_model(&ollama_url, model_hint)
     {
-        if let Ok(model_name) = detect_ollama_model(&ollama_url, model_hint) {
-            return Ok(BenchTarget::Ollama {
-                url: ollama_url,
-                model: model_name,
-            });
-        }
+        return Ok(BenchTarget::Ollama {
+            url: ollama_url,
+            model: model_name,
+        });
     }
 
     // Check MLX
@@ -380,13 +379,12 @@ pub fn auto_detect_target(model_hint: Option<&str>) -> Result<BenchTarget, Strin
         .build()
         .call()
         .is_ok()
+        && let Ok(model_name) = detect_openai_model(&mlx_url, model_hint)
     {
-        if let Ok(model_name) = detect_openai_model(&mlx_url, model_hint) {
-            return Ok(BenchTarget::Mlx {
-                url: mlx_url,
-                model: model_name,
-            });
-        }
+        return Ok(BenchTarget::Mlx {
+            url: mlx_url,
+            model: model_name,
+        });
     }
 
     Err("No inference provider found. Start Ollama, vLLM, or MLX first.".to_string())
@@ -518,10 +516,10 @@ fn detect_openai_model(base_url: &str, hint: Option<&str>) -> Result<String, Str
     if let Some(hint) = hint {
         let hint_lower = hint.to_lowercase();
         for m in models {
-            if let Some(id) = m.get("id").and_then(|i: &serde_json::Value| i.as_str()) {
-                if id.to_lowercase().contains(&hint_lower) {
-                    return Ok(id.to_string());
-                }
+            if let Some(id) = m.get("id").and_then(|i: &serde_json::Value| i.as_str())
+                && id.to_lowercase().contains(&hint_lower)
+            {
+                return Ok(id.to_string());
             }
         }
     }

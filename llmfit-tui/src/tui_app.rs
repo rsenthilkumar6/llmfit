@@ -4,12 +4,11 @@ use llmfit_core::models::{Capability, ModelDatabase, UseCase};
 use llmfit_core::plan::{PlanEstimate, PlanRequest, estimate_model_plan};
 use llmfit_core::providers::{
     self, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
-    ModelProvider, OllamaProvider, PullEvent, PullHandle, VllmProvider,
+    ModelProvider, OllamaProvider, PullEvent, PullHandle, VllmProvider, command_exists,
 };
 use llmfit_core::quality;
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Add;
 use std::sync::mpsc;
 use std::{cmp, thread};
 
@@ -1713,6 +1712,9 @@ impl App {
     pub fn search_input(&mut self, c: char) {
         self.search_query.insert(self.cursor_position, c);
         self.cursor_position += c.len_utf8();
+        // Changing the query should snap the list back to the top so all
+        // matches are visible regardless of the prior cursor position.
+        self.selected_row = 0;
         self.apply_filters();
     }
 
@@ -1721,6 +1723,7 @@ impl App {
             let prev = previous_grapheme_boundary(&self.search_query, self.cursor_position);
             self.search_query.drain(prev..self.cursor_position);
             self.cursor_position = prev;
+            self.selected_row = 0;
             self.apply_filters();
         }
     }
@@ -1729,6 +1732,7 @@ impl App {
         if self.cursor_position < self.search_query.len() {
             let next = next_grapheme_boundary(&self.search_query, self.cursor_position);
             self.search_query.drain(self.cursor_position..next);
+            self.selected_row = 0;
             self.apply_filters();
         }
     }
@@ -1749,6 +1753,7 @@ impl App {
     pub fn clear_search(&mut self) {
         self.search_query.clear();
         self.cursor_position = 0;
+        self.selected_row = 0;
         self.apply_filters();
     }
 
@@ -2079,16 +2084,13 @@ impl App {
 
         // Try each preset and see if the GPU name matches
         for preset in llmfit_core::benchmarks::HardwarePreset::all() {
-            if let Some(hw_name) = preset.hardware_name {
-                if lower.contains(&hw_name.to_lowercase()) {
-                    if let Some(cached) =
-                        llmfit_core::benchmarks::cached_leaderboard_for_preset(preset.label)
-                    {
-                        if !cached.rows.is_empty() {
-                            return Some(cached);
-                        }
-                    }
-                }
+            if let Some(hw_name) = preset.hardware_name
+                && lower.contains(&hw_name.to_lowercase())
+                && let Some(cached) =
+                    llmfit_core::benchmarks::cached_leaderboard_for_preset(preset.label)
+                && !cached.rows.is_empty()
+            {
+                return Some(cached);
             }
         }
         None
@@ -3961,10 +3963,8 @@ impl App {
         self.live_bench_scroll = 0;
         self.bench_view_mode = BenchViewMode::Results;
 
-        if !self.bench_running && self.ollama_available {
-            if !self.load_bench_cache() {
-                self.start_bench();
-            }
+        if !self.bench_running && self.ollama_available && !self.load_bench_cache() {
+            self.start_bench();
         }
     }
 
@@ -4040,25 +4040,22 @@ impl App {
             return false;
         }
 
-        if let Some(results) = cache.get("results") {
-            if let Ok(r) =
+        if let Some(results) = cache.get("results")
+            && let Ok(r) =
                 serde_json::from_value::<Vec<quality::ModelQualityResult>>(results.clone())
-            {
-                self.bench_results = r;
-            }
+        {
+            self.bench_results = r;
         }
-        if let Some(routing) = cache.get("routing") {
-            if let Ok(r) =
+        if let Some(routing) = cache.get("routing")
+            && let Ok(r) =
                 serde_json::from_value::<Vec<quality::RoutingRecommendation>>(routing.clone())
-            {
-                self.bench_routing = r;
-            }
+        {
+            self.bench_routing = r;
         }
-        if let Some(ru) = cache.get("runner_ups") {
-            if let Ok(r) = serde_json::from_value::<Vec<quality::RoutingRecommendation>>(ru.clone())
-            {
-                self.bench_runner_ups = r;
-            }
+        if let Some(ru) = cache.get("runner_ups")
+            && let Ok(r) = serde_json::from_value::<Vec<quality::RoutingRecommendation>>(ru.clone())
+        {
+            self.bench_runner_ups = r;
         }
 
         // Rebuild model status from cached results
@@ -4319,16 +4316,6 @@ impl App {
     }
 }
 
-fn command_exists(name: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4377,6 +4364,7 @@ mod tests {
             release_date: None,
             gguf_sources: Vec::new(),
             capabilities: Vec::new(),
+            languages: Vec::new(),
             format: ModelFormat::Gguf,
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -4416,6 +4404,7 @@ mod tests {
             installed: false,
             fits_with_turboquant: false,
             effective_context_length: 8192,
+            usable_context: 8192,
         }
     }
 
@@ -4573,5 +4562,76 @@ mod tests {
         app.dm_dir_backspace();
         assert_eq!(app.dm_dir_input, "一a");
         assert_eq!(app.dm_dir_cursor, 0);
+    }
+
+    // Reset every filter that `with_specs_and_context` may restore from a
+    // persisted filters.json so search tests are deterministic regardless of
+    // the developer's saved llmfit state.
+    fn clear_persisted_filters(app: &mut App) {
+        app.search_query.clear();
+        app.cursor_position = 0;
+        app.fit_filter = FitFilter::All;
+        app.availability_filter = AvailabilityFilter::All;
+        app.tp_filter = TpFilter::All;
+        app.filter_params_min_input.clear();
+        app.filter_params_max_input.clear();
+        app.filter_mem_pct_min_input.clear();
+        app.filter_mem_pct_max_input.clear();
+    }
+
+    #[test]
+    fn changing_search_query_resets_selection_to_top() {
+        let mut app = test_app();
+        clear_persisted_filters(&mut app);
+        app.all_fits = vec![
+            test_fit("gemma-2b", FitLevel::Good, 90.0),
+            test_fit("gemma-7b", FitLevel::Good, 80.0),
+            test_fit("llama-7b", FitLevel::Good, 70.0),
+        ];
+        app.providers = vec!["Test".to_string()];
+        app.selected_providers = vec![true];
+        app.apply_filters();
+        assert_eq!(app.filtered_fits.len(), 3);
+
+        // Cursor parked deep in the full list, mimicking the user having
+        // navigated far down before searching.
+        app.selected_row = app.filtered_fits.len() - 1;
+
+        // Typing a query must snap the viewport back to the top so every
+        // match is visible (issue #657).
+        app.search_input('g');
+        assert!(!app.filtered_fits.is_empty());
+        assert_eq!(app.selected_row, 0);
+
+        // Clearing the search also resets to the top.
+        app.selected_row = app.filtered_fits.len() - 1;
+        app.clear_search();
+        assert_eq!(app.filtered_fits.len(), 3);
+        assert_eq!(app.selected_row, 0);
+
+        // Backspacing the query resets to the top too.
+        app.search_input('g');
+        app.selected_row = app.filtered_fits.len() - 1;
+        app.search_backspace();
+        assert!(!app.filtered_fits.is_empty());
+        assert_eq!(app.selected_row, 0);
+    }
+
+    #[test]
+    fn search_query_with_no_matches_keeps_selection_at_zero() {
+        let mut app = test_app();
+        clear_persisted_filters(&mut app);
+        app.all_fits = vec![test_fit("gemma-2b", FitLevel::Good, 90.0)];
+        app.providers = vec!["Test".to_string()];
+        app.selected_providers = vec![true];
+        app.apply_filters();
+
+        // A query that matches nothing must not panic on the clamp path and
+        // leaves the selection at the top.
+        app.search_input('z');
+        app.search_input('z');
+        app.search_input('z');
+        assert!(app.filtered_fits.is_empty());
+        assert_eq!(app.selected_row, 0);
     }
 }

@@ -308,14 +308,14 @@ impl LlmfitMcpServer {
 
         let mut models = Vec::new();
         while let Some(result) = set.join_next().await {
-            if let Ok((name, available, installed)) = result {
-                if available {
-                    for model_name in installed {
-                        models.push(InstalledModel {
-                            name: model_name,
-                            runtime: name.to_string(),
-                        });
-                    }
+            if let Ok((name, available, installed)) = result
+                && available
+            {
+                for model_name in installed {
+                    models.push(InstalledModel {
+                        name: model_name,
+                        runtime: name.to_string(),
+                    });
                 }
             }
         }

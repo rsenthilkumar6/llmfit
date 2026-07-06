@@ -130,7 +130,7 @@ pub fn display_model_fits(fits: &[ModelFit]) {
                 runtime: fit.runtime_text().to_string(),
                 mode: fit.run_mode_text().to_string(),
                 mem_use: format!("{:.1}%", fit.utilization_pct),
-                context: format!("{}k", fit.model.context_length / 1000),
+                context: fit.context_display(),
                 release_date: fit
                     .model
                     .release_date
@@ -682,6 +682,7 @@ fn system_json(specs: &SystemSpecs) -> serde_json::Value {
                 "backend": g.backend.label(),
                 "count": g.count,
                 "unified_memory": g.unified_memory,
+                "memory_bandwidth_gbps": llmfit_core::hardware::gpu_memory_bandwidth_gbps(&g.name),
             })
         })
         .collect();
@@ -709,6 +710,7 @@ fn fit_to_json(fit: &ModelFit) -> serde_json::Value {
         "params_b": round2(fit.model.params_b()),
         "context_length": fit.model.context_length,
         "effective_context_length": fit.effective_context_length,
+        "usable_context": fit.usable_context,
         "use_case": fit.model.use_case,
         "category": fit.use_case.label(),
         "release_date": fit.model.release_date,
@@ -955,6 +957,7 @@ mod tests {
                     provider: "test".to_string(),
                 }],
                 capabilities: vec![],
+                languages: vec![],
                 format: ModelFormat::Gguf,
                 num_attention_heads: None,
                 num_key_value_heads: None,
@@ -989,6 +992,7 @@ mod tests {
             installed: false,
             fits_with_turboquant: false,
             effective_context_length: 8_192,
+            usable_context: 8_192,
         }
     }
 

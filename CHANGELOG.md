@@ -1,5 +1,80 @@
 # Changelog
 
+## [0.9.38](https://github.com/AlexsJones/llmfit/compare/v0.9.37...v0.9.38) (2026-07-04)
+
+
+### Bug Fixes
+
+* **docker:** drop COPY of removed root data/ directory ([a4445c7](https://github.com/AlexsJones/llmfit/commit/a4445c70885ee399a5b8e39b4ded938a09230064))
+* **docker:** drop COPY of removed root data/ directory ([5bb514d](https://github.com/AlexsJones/llmfit/commit/5bb514d130964311617269b0cffd4663a31522e3))
+
+## [0.9.37](https://github.com/AlexsJones/llmfit/compare/v0.9.36...v0.9.37) (2026-07-03)
+
+
+### Features
+
+* **calibration:** weekly benchmark refresh + estimate-accuracy audit ([#112](https://github.com/AlexsJones/llmfit/issues/112)/[#119](https://github.com/AlexsJones/llmfit/issues/119)) ([5548723](https://github.com/AlexsJones/llmfit/commit/55487236685fde60a2be09580fe892daeb6a9b8b))
+* **calibration:** weekly benchmark refresh + estimate-accuracy audit against measured data ([6c40dcf](https://github.com/AlexsJones/llmfit/commit/6c40dcf3127ada85a47cb4023c41fee28d33ec3e))
+* **claim:** JSON output for programmatic consumers (llmfit-dra M0) ([f469c22](https://github.com/AlexsJones/llmfit/commit/f469c22cb48cc8e15b33119cd7cf166474ab50a7))
+* **claim:** machine-readable JSON output via the global --json flag ([1636e51](https://github.com/AlexsJones/llmfit/commit/1636e51bb8b452b6c9ab8e47f38e0ac764f25f2f))
+
+
+### Bug Fixes
+
+* **calibration:** exclude speculative-decoding/MTP runs from the accuracy audit ([1c058aa](https://github.com/AlexsJones/llmfit/commit/1c058aa22bd57456487a15aa618155fd1340ef26))
+
+## [0.9.36](https://github.com/AlexsJones/llmfit/compare/v0.9.35...v0.9.36) (2026-07-03)
+
+
+### Features
+
+* add 'llmfit doctor' hardware diagnostic report for bug reports ([53663bc](https://github.com/AlexsJones/llmfit/commit/53663bcb9935d79c6f959b357d99d622d6cbcef1))
+* add `llmfit doctor` hardware diagnostic report ([bcd7dc0](https://github.com/AlexsJones/llmfit/commit/bcd7dc0c89b48909cfdd0ce20813bd58a2e84aeb))
+* add issue templates for bug reports ([bab1fe9](https://github.com/AlexsJones/llmfit/commit/bab1fe9166a037aac1e3d4da10484e0f91812bc1))
+* request 'llmfit doctor' output in the bug report template ([b4069d9](https://github.com/AlexsJones/llmfit/commit/b4069d927b9f7d271664d9e24324b3fe5716fa29))
+* **scoring:** benchmark-informed task alignment per use case ([ce6d37e](https://github.com/AlexsJones/llmfit/commit/ce6d37e034b3978e687a00589ac7ce10e81ae7e9))
+* **scoring:** benchmark-informed task alignment per use case (issue [#150](https://github.com/AlexsJones/llmfit/issues/150)) ([c994615](https://github.com/AlexsJones/llmfit/commit/c994615357f1b2577ba5096d7d176cf928f27a56))
+* serve over a Unix domain socket (--unix-socket) ([de62c2b](https://github.com/AlexsJones/llmfit/commit/de62c2bc7e2af432771e0036b35e5fb76a50ed7e))
+* serve over a Unix domain socket (--unix-socket) ([03d6ca5](https://github.com/AlexsJones/llmfit/commit/03d6ca5170df4f924b3bf24e94f27035fa26bb6a))
+* show usable context per model (native→achievable) in TUI, CLI, and JSON ([e33a3a3](https://github.com/AlexsJones/llmfit/commit/e33a3a31be5a7a7b3953c4f33a02732c1790353c)), closes [#621](https://github.com/AlexsJones/llmfit/issues/621)
+* usable-context display — native→achievable (closes [#621](https://github.com/AlexsJones/llmfit/issues/621)) ([1706929](https://github.com/AlexsJones/llmfit/commit/1706929ea367fd137117173f56827640bc04404c))
+* user-local custom model overlay (closes [#451](https://github.com/AlexsJones/llmfit/issues/451)) ([decef82](https://github.com/AlexsJones/llmfit/commit/decef827b3785df9a5c785b49ed128f98d5c3aaa))
+* user-local custom model overlay (custom_models.json) ([e55c8de](https://github.com/AlexsJones/llmfit/commit/e55c8dec388a1788b6093e0ef4c1091149cfe3d9)), closes [#451](https://github.com/AlexsJones/llmfit/issues/451)
+
+
+### Bug Fixes
+
+* guard optional attribute lookups in generated claim CEL ([c6f481f](https://github.com/AlexsJones/llmfit/commit/c6f481f27557d3e0fd6fc584fd1b1fa008ff95a4))
+* guard optional attribute lookups in generated claim CEL ([a6f3c6a](https://github.com/AlexsJones/llmfit/commit/a6f3c6a6bc11e3a4c141dc7e0c3891263958a712))
+* **hardware:** correct Intel GPU detection — iGPUs get the unified RAM pool, dGPUs get Vulkan VRAM ([4834767](https://github.com/AlexsJones/llmfit/commit/4834767462a7ac939ddb0306796e9661913f8310))
+* **hardware:** detect generic-named MI50-class accelerators (issue [#638](https://github.com/AlexsJones/llmfit/issues/638)) ([180f484](https://github.com/AlexsJones/llmfit/commit/180f4844630e4ca08e8971482a615564d5be64f8))
+* **hardware:** don't drop large-VRAM AMD accelerators with generic ROCm names ([bf16eb8](https://github.com/AlexsJones/llmfit/commit/bf16eb8e87b31e1c0f5c6154e82f7b8967d54085))
+* **hardware:** Intel iGPU unified-memory pool + discrete Arc VRAM via Vulkan (issue [#609](https://github.com/AlexsJones/llmfit/issues/609)) ([a120aa3](https://github.com/AlexsJones/llmfit/commit/a120aa38d9410b2d874bbe7c70653b4f2c1920b7))
+* **schema:** add 'audio' to capability enum ([a812232](https://github.com/AlexsJones/llmfit/commit/a812232f0eb02dc66544e508fe6e5e587acbd1f0))
+
+## [0.9.35](https://github.com/AlexsJones/llmfit/compare/v0.9.34...v0.9.35) (2026-07-02)
+
+
+### Features
+
+* add claim subcommand generating Kubernetes DRA ResourceClaims ([08547ef](https://github.com/AlexsJones/llmfit/commit/08547efa277dd3f733ecdf72312a3376fbc2a01b))
+* add claim subcommand generating Kubernetes DRA ResourceClaims ([3369a49](https://github.com/AlexsJones/llmfit/commit/3369a492630f357c65e2344de18b5a2e35ed4950))
+* expose GPU memory bandwidth in system JSON and add Strix Halo entries ([3bfd334](https://github.com/AlexsJones/llmfit/commit/3bfd33406b071f48fddc7fb6e99fe62e55096511))
+
+
+### Bug Fixes
+
+* reset list cursor to top when the search query changes ([5e4dc7b](https://github.com/AlexsJones/llmfit/commit/5e4dc7b1e578c5a2366a8f7b94220d68178e2fae))
+* reset list cursor to top when the search query changes ([43884f5](https://github.com/AlexsJones/llmfit/commit/43884f500a9b392b03bc2d2bc539ba6430d954fd)), closes [#657](https://github.com/AlexsJones/llmfit/issues/657)
+
+## [0.9.34](https://github.com/AlexsJones/llmfit/compare/v0.9.33...v0.9.34) (2026-06-28)
+
+
+### Bug Fixes
+
+* pin Docker builder to bookworm to match runtime glibc ([f13a633](https://github.com/AlexsJones/llmfit/commit/f13a6332e62713b22bf96b7a26b551f43caed831))
+* pin Docker builder to bookworm to match runtime glibc ([48caf17](https://github.com/AlexsJones/llmfit/commit/48caf178baaf7e7c0f81bfd30f4972b404528cf7)), closes [#655](https://github.com/AlexsJones/llmfit/issues/655)
+
 ## [0.9.33](https://github.com/AlexsJones/llmfit/compare/v0.9.32...v0.9.33) (2026-06-23)
 
 

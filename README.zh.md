@@ -982,6 +982,18 @@ Agent 会在后台调用 `llmfit recommend --json`，解读结果，并提议用
 
 ---
 
+## 代码签名
+
+llmfit 的 Windows 发布二进制文件通过 [SignPath.io](https://about.signpath.io/) 进行数字签名（Authenticode），代码签名证书由 [SignPath Foundation](https://signpath.org/) 免费提供。
+
+签名在[发布流水线](.github/workflows/release.yml)中自动完成：只有由 GitHub Actions 从本仓库构建的产物才会提交签名，签名请求由项目维护者（[@AlexsJones](https://github.com/AlexsJones)）审批。
+
+**代码签名政策：**参见 [SignPath Foundation 代码签名政策与条款](https://signpath.org/terms)。
+
+**隐私：**除非用户或安装/运行本程序的人员明确请求，本程序不会向其他联网系统传输任何信息。llmfit 仅在你明确使用相应功能时才会访问外部服务（例如模型下载、运行时提供商查询或社区排行榜）。
+
+---
+
 ## 许可证
 
 MIT

@@ -101,6 +101,8 @@ pub struct LeaderboardEntry {
     #[serde(default)]
     pub engine: Option<LeaderboardEngine>,
     #[serde(default)]
+    pub engine_flags: Option<LeaderboardEngineFlags>,
+    #[serde(default)]
     pub user: Option<LeaderboardUser>,
 }
 
@@ -117,6 +119,19 @@ pub struct LeaderboardModel {
     pub params: Option<f64>,
     #[serde(default)]
     pub is_mo_e: Option<bool>,
+}
+
+/// Per-run engine acceleration flags. Speculative decoding and MTP runs
+/// measure draft-accelerated throughput, which can exceed the memory
+/// bandwidth roofline that plain autoregressive estimates model — consumers
+/// comparing against `estimate_tps` must filter these out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaderboardEngineFlags {
+    #[serde(default)]
+    pub spec_decoding: Option<bool>,
+    #[serde(default)]
+    pub mtp_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,6 +353,18 @@ pub fn cached_leaderboard_for_preset(label: &str) -> Option<LeaderboardResponse>
 /// Returns the scrape timestamp of the embedded cache, if available.
 pub fn cache_timestamp() -> Option<&'static str> {
     embedded_cache().scraped_at.as_deref()
+}
+
+/// All preset labels present in the embedded benchmark cache. Used by the
+/// estimate-calibration test to replay every cached measurement.
+pub fn cached_preset_labels() -> Vec<&'static str> {
+    let mut labels: Vec<&'static str> = embedded_cache()
+        .presets
+        .keys()
+        .map(|s| s.as_str())
+        .collect();
+    labels.sort_unstable();
+    labels
 }
 
 // ── Fetch functions ──────────────────────────────────────────────────

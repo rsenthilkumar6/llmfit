@@ -7,6 +7,9 @@ pub const QUANT_HIERARCHY: &[&str] = &["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q3_K
 /// MLX-native quantization hierarchy (best quality to most compressed).
 pub const MLX_QUANT_HIERARCHY: &[&str] = &["mlx-8bit", "mlx-4bit"];
 
+/// ONNX catalog quantization hierarchy (best quality to most compressed).
+pub const ONNX_QUANT_HIERARCHY: &[&str] = &["Q8_0", "Q4_0"];
+
 /// Bytes per parameter for each quantization level.
 pub fn quant_bpp(quant: &str) -> f64 {
     match quant {
@@ -131,8 +134,7 @@ pub fn parse_generation(architecture: Option<&str>, name: &str) -> Option<f64> {
             return Some(1.0);
         }
         // Qwen: qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, qwen3_next
-        if arch_lower.starts_with("qwen") {
-            let suffix = &arch_lower["qwen".len()..];
+        if let Some(suffix) = arch_lower.strip_prefix("qwen") {
             if suffix.starts_with("3_5") || suffix.starts_with("3.5") {
                 return Some(3.5);
             }
@@ -151,16 +153,14 @@ pub fn parse_generation(architecture: Option<&str>, name: &str) -> Option<f64> {
             return Some(1.0);
         }
         // Llama: llama, llama4
-        if arch_lower.starts_with("llama") {
-            let suffix = &arch_lower["llama".len()..];
+        if let Some(suffix) = arch_lower.strip_prefix("llama") {
             if suffix.starts_with('4') {
                 return Some(4.0);
             }
             // Architecture is just "llama" — fall through to name-based parsing
         }
         // Gemma: gemma, gemma2, gemma3, gemma4
-        if arch_lower.starts_with("gemma") {
-            let suffix = &arch_lower["gemma".len()..];
+        if let Some(suffix) = arch_lower.strip_prefix("gemma") {
             if suffix.starts_with('4') {
                 return Some(4.0);
             }
@@ -173,8 +173,7 @@ pub fn parse_generation(architecture: Option<&str>, name: &str) -> Option<f64> {
             return Some(1.0);
         }
         // Phi: phi, phi3, phimoe
-        if arch_lower.starts_with("phi") {
-            let suffix = &arch_lower["phi".len()..];
+        if let Some(suffix) = arch_lower.strip_prefix("phi") {
             if suffix.starts_with('4') {
                 return Some(4.0);
             }
@@ -191,24 +190,21 @@ pub fn parse_generation(architecture: Option<&str>, name: &str) -> Option<f64> {
             return Some(1.0);
         }
         // Cohere: cohere, cohere2
-        if arch_lower.starts_with("cohere") {
-            let suffix = &arch_lower["cohere".len()..];
+        if let Some(suffix) = arch_lower.strip_prefix("cohere") {
             if suffix.starts_with('2') {
                 return Some(2.0);
             }
             return Some(1.0);
         }
         // Falcon: falcon, falcon3
-        if arch_lower.starts_with("falcon") {
-            let suffix = &arch_lower["falcon".len()..];
+        if let Some(suffix) = arch_lower.strip_prefix("falcon") {
             if suffix.starts_with('3') {
                 return Some(3.0);
             }
             return Some(1.0);
         }
         // Granite: granite, granite4
-        if arch_lower.starts_with("granite") {
-            let suffix = &arch_lower["granite".len()..];
+        if let Some(suffix) = arch_lower.strip_prefix("granite") {
             if suffix.starts_with('4') {
                 return Some(4.0);
             }
@@ -317,6 +313,7 @@ pub enum Capability {
     Vision,
     ToolUse,
     Audio,
+    Tts,
 }
 
 impl Capability {
@@ -325,11 +322,17 @@ impl Capability {
             Capability::Vision => "Vision",
             Capability::ToolUse => "Tool Use",
             Capability::Audio => "Audio",
+            Capability::Tts => "Text-to-Speech",
         }
     }
 
     pub fn all() -> &'static [Capability] {
-        &[Capability::Vision, Capability::ToolUse, Capability::Audio]
+        &[
+            Capability::Vision,
+            Capability::ToolUse,
+            Capability::Audio,
+            Capability::Tts,
+        ]
     }
 
     /// Infer capabilities from model metadata when not explicitly set in JSON.
@@ -376,11 +379,16 @@ impl Capability {
         if !caps.contains(&Capability::Audio)
             && (architecture.contains("whisper")
                 || name.contains("whisper")
+                || use_case.contains("text-to-speech")
                 || use_case.contains("transcription")
                 || use_case.contains("speech")
                 || use_case.contains("audio"))
         {
             caps.push(Capability::Audio);
+        }
+
+        if !caps.contains(&Capability::Tts) && use_case.contains("text-to-speech") {
+            caps.push(Capability::Tts);
         }
 
         caps
@@ -399,6 +407,7 @@ pub enum ModelFormat {
     Autoround,
     Mlx,
     Safetensors,
+    Onnx,
 }
 
 impl ModelFormat {
@@ -488,7 +497,10 @@ pub struct LlmModel {
     /// Model capabilities (vision, tool use, etc.)
     #[serde(default)]
     pub capabilities: Vec<Capability>,
-    /// Model weight format (gguf, awq, gptq, mlx, safetensors)
+    /// Explicitly declared supported languages from HuggingFace metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
+    /// Model weight format (gguf, awq, gptq, autoround, mlx, safetensors, onnx)
     #[serde(default)]
     pub format: ModelFormat,
     /// Number of attention heads (for tensor-parallelism compatibility checks).
@@ -687,6 +699,12 @@ impl LlmModel {
     /// that cannot be dynamically re-quantized.
     pub fn is_prequantized(&self) -> bool {
         self.format.is_prequantized()
+    }
+
+    /// Returns true for catalog entries that need a task-specific runtime not
+    /// yet modeled by llmfit's llama.cpp/MLX/vLLM fit paths.
+    pub fn requires_specialized_runtime(&self) -> bool {
+        self.capabilities.contains(&Capability::Tts)
     }
 
     /// Returns true if the model's attention/KV heads are evenly divisible
@@ -992,6 +1010,8 @@ struct HfModelEntry {
     #[serde(default)]
     capabilities: Vec<Capability>,
     #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
     format: ModelFormat,
     #[serde(default)]
     hf_downloads: u64,
@@ -1020,6 +1040,44 @@ struct HfModelEntry {
 }
 
 const HF_MODELS_JSON: &str = include_str!("../data/hf_models.json");
+const ONNX_MODELS_JSON: &str = include_str!("../data/onnx_models.json");
+
+/// Intermediate struct matching the ONNX seed catalog.
+///
+/// The source catalog keeps ONNX-specific file sizes. This converter projects
+/// those entries into the common LlmModel shape consumed by fit scoring and UI.
+#[derive(Debug, Clone, Deserialize)]
+struct OnnxModelEntry {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    parameters: Option<String>,
+    #[serde(default)]
+    parameter_count: Option<String>,
+    #[serde(default)]
+    parameters_raw: Option<u64>,
+    #[serde(default)]
+    min_ram_gb: Option<f64>,
+    #[serde(default)]
+    recommended_ram_gb: Option<f64>,
+    #[serde(default)]
+    min_vram_gb: Option<f64>,
+    #[serde(default)]
+    quantization: Option<String>,
+    #[serde(default)]
+    context_length: Option<u32>,
+    #[serde(default)]
+    use_case: Option<String>,
+    #[serde(default)]
+    capabilities: Vec<Capability>,
+    format: ModelFormat,
+    #[serde(default)]
+    license: Option<String>,
+    onnx_files: std::collections::BTreeMap<String, u64>,
+}
 
 pub struct ModelDatabase {
     models: Vec<LlmModel>,
@@ -1050,7 +1108,7 @@ pub(crate) fn canonical_slug(name: &str) -> String {
 /// - Numeric fields (params, RAM, context): higher wins.
 /// - MoE info: if either entry is MoE the result is MoE.
 /// - `release_date`: later wins.
-/// - `capabilities`, `gguf_sources`: union (no duplicates).
+/// - `capabilities`, `languages`, `gguf_sources`: union (no duplicates).
 /// - `hf_downloads`, `hf_likes`: maximum.
 /// - Architecture fields (`num_attention_heads`, etc.): first non-`None` wins.
 fn dedupe_hf_entries(entries: Vec<HfModelEntry>) -> Vec<HfModelEntry> {
@@ -1096,6 +1154,12 @@ fn dedupe_hf_entries(entries: Vec<HfModelEntry>) -> Vec<HfModelEntry> {
                         existing.capabilities.push(*cap);
                     }
                 }
+                // Merge languages (union, no duplicates).
+                for lang in &entry.languages {
+                    if !existing.languages.contains(lang) {
+                        existing.languages.push(lang.clone());
+                    }
+                }
                 // Merge gguf_sources (union by repo).
                 for src in &entry.gguf_sources {
                     if !existing.gguf_sources.iter().any(|s| s.repo == src.repo) {
@@ -1134,56 +1198,245 @@ fn dedupe_hf_entries(entries: Vec<HfModelEntry>) -> Vec<HfModelEntry> {
     map.into_values().collect()
 }
 
+/// Map a JSON catalog entry to an [`LlmModel`], inferring capabilities and
+/// attention layout where the entry doesn't carry them explicitly.
+fn entry_to_model(e: HfModelEntry) -> LlmModel {
+    let mut model = LlmModel {
+        name: e.name,
+        provider: e.provider,
+        parameter_count: e.parameter_count,
+        parameters_raw: e.parameters_raw,
+        min_ram_gb: e.min_ram_gb,
+        recommended_ram_gb: e.recommended_ram_gb,
+        min_vram_gb: e.min_vram_gb,
+        quantization: e.quantization,
+        context_length: e.context_length,
+        use_case: e.use_case,
+        is_moe: e.is_moe,
+        num_experts: e.num_experts,
+        active_experts: e.active_experts,
+        active_parameters: e.active_parameters,
+        release_date: e.release_date,
+        gguf_sources: e.gguf_sources,
+        capabilities: e.capabilities,
+        languages: e.languages,
+        format: e.format,
+        num_attention_heads: e.num_attention_heads,
+        num_key_value_heads: e.num_key_value_heads,
+        num_hidden_layers: e.num_hidden_layers,
+        head_dim: e.head_dim,
+        attention_layout: None,
+        hidden_size: e.hidden_size,
+        moe_intermediate_size: e.moe_intermediate_size,
+        vocab_size: e.vocab_size,
+        shared_expert_intermediate_size: e.shared_expert_intermediate_size,
+        license: e.license,
+        architecture: e.architecture,
+    };
+    model.capabilities = Capability::infer(&model);
+    // Auto-populate attention_layout from name heuristic for known
+    // hybrid families. Explicit metadata still wins (model.attention_layout
+    // stays None until the scraper is taught to read it from config.json).
+    if model.attention_layout.is_none() {
+        model.attention_layout = infer_attention_layout_from_name(&model.name);
+    }
+    model
+}
+
+fn parse_parameter_count_raw(parameter_count: &str) -> Option<u64> {
+    let trimmed = parameter_count.trim().to_uppercase();
+    let (number, multiplier) = if let Some(number) = trimmed.strip_suffix('B') {
+        (number, 1_000_000_000.0)
+    } else if let Some(number) = trimmed.strip_suffix('M') {
+        (number, 1_000_000.0)
+    } else {
+        return None;
+    };
+
+    number
+        .parse::<f64>()
+        .ok()
+        .map(|value| (value * multiplier).round() as u64)
+}
+
+fn normalize_onnx_quantization(quant: &str) -> String {
+    match quant.trim().to_lowercase().as_str() {
+        "fp32" | "f32" => "F32".to_string(),
+        "fp16" | "f16" | "bf16" => "F16".to_string(),
+        "q8" | "int8" | "uint8" | "q8_0" => "Q8_0".to_string(),
+        "q4" | "q4f16" | "bnb4" | "int4" | "q4_0" => "Q4_0".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn select_onnx_quantization(
+    onnx_files: &std::collections::BTreeMap<String, u64>,
+) -> Option<(&str, u64)> {
+    for preferred in ["q4", "q4f16", "bnb4", "q8", "int8", "uint8", "fp16", "fp32"] {
+        if let Some(bytes) = onnx_files.get(preferred) {
+            return Some((preferred, *bytes));
+        }
+    }
+
+    onnx_files
+        .iter()
+        .min_by_key(|(_, bytes)| *bytes)
+        .map(|(quant, bytes)| (quant.as_str(), *bytes))
+}
+
+fn infer_onnx_context_length(id: &str, display_name: Option<&str>) -> u32 {
+    let text = match display_name {
+        Some(name) => format!("{id} {name}").to_lowercase(),
+        None => id.to_lowercase(),
+    };
+
+    if text.contains("32k") || text.contains("qwen2.5") {
+        32_768
+    } else if text.contains("8k") || text.contains("smollm") {
+        8_192
+    } else {
+        4_096
+    }
+}
+
+fn infer_onnx_use_case(id: &str, display_name: Option<&str>) -> String {
+    let text = match display_name {
+        Some(name) => format!("{id} {name}").to_lowercase(),
+        None => id.to_lowercase(),
+    };
+
+    if text.contains("instruct") || text.contains("chat") || text.contains("-it") {
+        "Instruction-following chat".to_string()
+    } else {
+        "General purpose text generation".to_string()
+    }
+}
+
+impl OnnxModelEntry {
+    fn into_model(self) -> LlmModel {
+        assert_eq!(
+            self.format,
+            ModelFormat::Onnx,
+            "onnx_models.json entries must use format = \"onnx\""
+        );
+
+        let (selected_quant, selected_bytes) = select_onnx_quantization(&self.onnx_files)
+            .expect("onnx_models.json entries must include at least one ONNX file size");
+        let weights_gib = selected_bytes as f64 / 1_073_741_824.0;
+        let min_ram_gb = self.min_ram_gb.unwrap_or((weights_gib * 1.2).max(0.5));
+        let recommended_ram_gb = self
+            .recommended_ram_gb
+            .unwrap_or((weights_gib * 2.0).max(min_ram_gb));
+        let min_vram_gb = self.min_vram_gb.or(Some((weights_gib * 1.1).max(0.5)));
+        let parameter_count = self
+            .parameter_count
+            .or(self.parameters)
+            .unwrap_or_else(|| "Unknown".to_string());
+        let display_name = self.name.as_deref();
+        let provider = self
+            .provider
+            .unwrap_or_else(|| self.id.split('/').next().unwrap_or("unknown").to_string());
+        let quantization = self
+            .quantization
+            .as_deref()
+            .map(normalize_onnx_quantization)
+            .unwrap_or_else(|| normalize_onnx_quantization(selected_quant));
+
+        let mut model = LlmModel {
+            name: self.id.clone(),
+            provider,
+            parameter_count: parameter_count.clone(),
+            parameters_raw: self
+                .parameters_raw
+                .or_else(|| parse_parameter_count_raw(&parameter_count)),
+            min_ram_gb,
+            recommended_ram_gb,
+            min_vram_gb,
+            quantization,
+            context_length: self
+                .context_length
+                .unwrap_or_else(|| infer_onnx_context_length(&self.id, display_name)),
+            use_case: self
+                .use_case
+                .unwrap_or_else(|| infer_onnx_use_case(&self.id, display_name)),
+            is_moe: false,
+            num_experts: None,
+            active_experts: None,
+            active_parameters: None,
+            release_date: None,
+            gguf_sources: vec![],
+            capabilities: self.capabilities,
+            languages: vec![],
+            format: ModelFormat::Onnx,
+            num_attention_heads: None,
+            num_key_value_heads: None,
+            num_hidden_layers: None,
+            head_dim: None,
+            attention_layout: None,
+            hidden_size: None,
+            moe_intermediate_size: None,
+            vocab_size: None,
+            shared_expert_intermediate_size: None,
+            license: self.license,
+            architecture: None,
+        };
+        model.capabilities = Capability::infer(&model);
+        model
+    }
+}
+
 /// Parse the compile-time embedded JSON into a flat `Vec<LlmModel>`.
 fn load_embedded() -> Vec<LlmModel> {
     let entries: Vec<HfModelEntry> =
         serde_json::from_str(HF_MODELS_JSON).expect("Failed to parse embedded hf_models.json");
     // Deduplicate before mapping: ensures downstream code never sees two rows
     // for the same model slug with conflicting metadata.
-    dedupe_hf_entries(entries)
+    let mut models: Vec<LlmModel> = dedupe_hf_entries(entries)
         .into_iter()
-        .map(|e| {
-            let mut model = LlmModel {
-                name: e.name,
-                provider: e.provider,
-                parameter_count: e.parameter_count,
-                parameters_raw: e.parameters_raw,
-                min_ram_gb: e.min_ram_gb,
-                recommended_ram_gb: e.recommended_ram_gb,
-                min_vram_gb: e.min_vram_gb,
-                quantization: e.quantization,
-                context_length: e.context_length,
-                use_case: e.use_case,
-                is_moe: e.is_moe,
-                num_experts: e.num_experts,
-                active_experts: e.active_experts,
-                active_parameters: e.active_parameters,
-                release_date: e.release_date,
-                gguf_sources: e.gguf_sources,
-                capabilities: e.capabilities,
-                format: e.format,
-                num_attention_heads: e.num_attention_heads,
-                num_key_value_heads: e.num_key_value_heads,
-                num_hidden_layers: e.num_hidden_layers,
-                head_dim: e.head_dim,
-                attention_layout: None,
-                hidden_size: e.hidden_size,
-                moe_intermediate_size: e.moe_intermediate_size,
-                vocab_size: e.vocab_size,
-                shared_expert_intermediate_size: e.shared_expert_intermediate_size,
-                license: e.license,
-                architecture: e.architecture,
-            };
-            model.capabilities = Capability::infer(&model);
-            // Auto-populate attention_layout from name heuristic for known
-            // hybrid families. Explicit metadata still wins (model.attention_layout
-            // stays None until the scraper is taught to read it from config.json).
-            if model.attention_layout.is_none() {
-                model.attention_layout = infer_attention_layout_from_name(&model.name);
-            }
-            model
-        })
-        .collect()
+        .map(entry_to_model)
+        .collect();
+
+    let onnx_entries: Vec<OnnxModelEntry> =
+        serde_json::from_str(ONNX_MODELS_JSON).expect("Failed to parse embedded onnx_models.json");
+    let onnx_models: Vec<LlmModel> = onnx_entries
+        .into_iter()
+        .map(OnnxModelEntry::into_model)
+        .collect();
+    let onnx_names: std::collections::HashSet<&str> = onnx_models
+        .iter()
+        .map(|model| model.name.as_str())
+        .collect();
+    models.retain(|model| !onnx_names.contains(model.name.as_str()));
+    models.extend(onnx_models);
+    models
+}
+
+/// Full path to the user's custom model overlay file, alongside the update
+/// cache (e.g. `~/.local/share/llmfit/custom_models.json` on Linux).
+/// The `LLMFIT_CUSTOM_MODELS` env var overrides the location.
+pub fn custom_models_file() -> Option<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("LLMFIT_CUSTOM_MODELS") {
+        return Some(std::path::PathBuf::from(path));
+    }
+    Some(crate::update::cache_dir()?.join("custom_models.json"))
+}
+
+/// Load user-defined models from a JSON file using the same entry schema as
+/// the embedded catalog (`hf_models.json`). Returns an error string for a
+/// present-but-invalid file so callers can warn instead of silently dropping
+/// hand-written entries; a missing file is `Ok(vec![])`.
+fn load_custom_models_from(path: &std::path::Path) -> Result<Vec<LlmModel>, String> {
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let entries: Vec<HfModelEntry> = serde_json::from_str(&content)
+        .map_err(|e| format!("invalid JSON in {}: {e}", path.display()))?;
+    Ok(dedupe_hf_entries(entries)
+        .into_iter()
+        .map(entry_to_model)
+        .collect())
 }
 
 impl ModelDatabase {
@@ -1195,23 +1448,41 @@ impl ModelDatabase {
         }
     }
 
-    /// Load the embedded model list **and** merge any locally cached models.
+    /// Load the embedded model list **and** merge user custom models and any
+    /// locally cached models.
     ///
-    /// Cached models are appended after the embedded ones; if an ID already
-    /// exists in the embedded list it is skipped to avoid duplication.
-    /// Silently ignores a missing or corrupt cache file.
+    /// Precedence: custom models (see [`custom_models_file`]) replace embedded
+    /// entries with the same canonical slug; cached models (from
+    /// `llmfit update`) are appended only for slugs not already present.
+    /// A missing cache/custom file is ignored; a *corrupt* custom file prints
+    /// a warning to stderr so hand-written entries don't vanish silently.
     pub fn new() -> Self {
         let mut models = load_embedded();
+
+        // Overlay user-defined models: same slug replaces the embedded entry,
+        // new slugs are appended.
+        if let Some(path) = custom_models_file() {
+            match load_custom_models_from(&path) {
+                Ok(custom) if !custom.is_empty() => {
+                    let custom_keys: std::collections::HashSet<String> =
+                        custom.iter().map(|m| canonical_slug(&m.name)).collect();
+                    models.retain(|m| !custom_keys.contains(&canonical_slug(&m.name)));
+                    models.extend(custom);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("Warning: skipping custom models: {e}"),
+            }
+        }
 
         // Merge cached models (from `llmfit update`) without duplicating.
         // canonical_slug normalizes org/ prefix, case, and separators so that
         // e.g. `meta-llama/Llama-3.1-8B` and `meta-llama/llama-3.1-8b` are
         // treated as the same model.
-        let embedded_keys: std::collections::HashSet<String> =
+        let existing_keys: std::collections::HashSet<String> =
             models.iter().map(|m| canonical_slug(&m.name)).collect();
 
         for cached in crate::update::load_cache() {
-            if !embedded_keys.contains(&canonical_slug(&cached.name)) {
+            if !existing_keys.contains(&canonical_slug(&cached.name)) {
                 models.push(cached);
             }
         }
@@ -1440,6 +1711,81 @@ fn infer_heads_from_name(name: &str, params_b: f64) -> (u32, u32) {
 mod tests {
     use super::*;
 
+    // ────────────────────────────────────────────────────────────────────
+    // Custom model overlay tests
+    // ────────────────────────────────────────────────────────────────────
+
+    const CUSTOM_ENTRY_JSON: &str = r#"[{
+        "name": "acme/CustomNet-7B",
+        "provider": "acme",
+        "parameter_count": "7B",
+        "min_ram_gb": 5.0,
+        "recommended_ram_gb": 8.0,
+        "min_vram_gb": 5.0,
+        "quantization": "Q4_K_M",
+        "context_length": 32768,
+        "use_case": "Testing"
+    }]"#;
+
+    fn write_temp_json(name: &str, content: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("llmfit-test-{}-{name}", std::process::id()));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_load_custom_models_missing_file_is_empty() {
+        let path = std::path::Path::new("/nonexistent/llmfit-custom-models.json");
+        assert_eq!(load_custom_models_from(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_load_custom_models_parses_minimal_entry() {
+        let path = write_temp_json("minimal.json", CUSTOM_ENTRY_JSON);
+        let models = load_custom_models_from(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.name, "acme/CustomNet-7B");
+        assert_eq!(m.context_length, 32768);
+        assert_eq!(m.quantization, "Q4_K_M");
+    }
+
+    #[test]
+    fn test_load_custom_models_invalid_json_is_error_not_empty() {
+        let path = write_temp_json("broken.json", "[{\"name\": ");
+        let result = load_custom_models_from(&path);
+        std::fs::remove_file(&path).ok();
+
+        let err = result.unwrap_err();
+        assert!(err.contains("invalid JSON"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_custom_overlay_replaces_embedded_entry_by_slug() {
+        // Simulate the overlay step in ModelDatabase::new() against the real
+        // embedded catalog: a custom entry whose slug matches an embedded
+        // model must replace it rather than duplicate it.
+        let mut models = load_embedded();
+        let original_len = models.len();
+        let victim = models[0].name.clone();
+
+        let json = CUSTOM_ENTRY_JSON.replace("acme/CustomNet-7B", &victim);
+        let path = write_temp_json("override.json", &json);
+        let custom = load_custom_models_from(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let custom_keys: std::collections::HashSet<String> =
+            custom.iter().map(|m| canonical_slug(&m.name)).collect();
+        models.retain(|m| !custom_keys.contains(&canonical_slug(&m.name)));
+        models.extend(custom);
+
+        assert_eq!(models.len(), original_len, "override must not duplicate");
+        let replaced = models.iter().find(|m| m.name == victim).unwrap();
+        assert_eq!(replaced.use_case, "Testing");
+    }
+
     #[test]
     fn test_matches_license_filter_handles_comma_separated_model_licenses() {
         let license = Some("apache-2.0,mit".to_string());
@@ -1527,6 +1873,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1609,6 +1956,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1645,6 +1993,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1681,6 +2030,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1717,6 +2067,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1761,6 +2112,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1811,6 +2163,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1845,6 +2198,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1887,6 +2241,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1921,6 +2276,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -1965,6 +2321,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2001,6 +2358,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2037,6 +2395,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2090,6 +2449,7 @@ mod tests {
                     provider: "test".to_string(),
                 }],
                 capabilities: vec![Capability::Vision],
+                languages: vec!["en".to_string()],
                 format: ModelFormat::Safetensors,
                 hf_downloads: 10_000,
                 hf_likes: 500,
@@ -2126,6 +2486,7 @@ mod tests {
                     provider: "unsloth".to_string(),
                 }],
                 capabilities: vec![Capability::ToolUse],
+                languages: vec!["de".to_string()],
                 format: ModelFormat::Gguf,
                 hf_downloads: 100,
                 hf_likes: 10,
@@ -2173,6 +2534,9 @@ mod tests {
         // Capabilities: union of both entries
         assert!(m.capabilities.contains(&Capability::Vision));
         assert!(m.capabilities.contains(&Capability::ToolUse));
+
+        // Languages: union of explicit metadata
+        assert_eq!(m.languages, vec!["en", "de"]);
 
         // GGUF sources: both repos present
         assert_eq!(m.gguf_sources.len(), 2);
@@ -2257,6 +2621,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2296,6 +2661,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2334,6 +2700,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2371,6 +2738,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![Capability::Vision],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: None,
             num_key_value_heads: None,
@@ -2415,6 +2783,7 @@ mod tests {
         assert!(!ModelFormat::Gguf.is_prequantized());
         assert!(!ModelFormat::Mlx.is_prequantized());
         assert!(!ModelFormat::Safetensors.is_prequantized());
+        assert!(!ModelFormat::Onnx.is_prequantized());
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -2444,6 +2813,47 @@ mod tests {
         }"#;
         let entry: HfModelEntry = serde_json::from_str(json).unwrap();
         assert!(entry.gguf_sources.is_empty());
+        assert!(entry.languages.is_empty());
+    }
+
+    #[test]
+    fn test_capability_infer_tts_adds_audio_and_tts() {
+        let model = LlmModel {
+            name: "hexgrad/Kokoro-82M".to_string(),
+            provider: "hexgrad".to_string(),
+            parameter_count: "82M".to_string(),
+            parameters_raw: Some(82_000_000),
+            min_ram_gb: 1.0,
+            recommended_ram_gb: 2.0,
+            min_vram_gb: Some(0.5),
+            quantization: "Q4_K_M".to_string(),
+            context_length: 4096,
+            use_case: "Text-to-speech".to_string(),
+            is_moe: false,
+            num_experts: None,
+            active_experts: None,
+            active_parameters: None,
+            release_date: None,
+            gguf_sources: vec![],
+            capabilities: vec![],
+            languages: vec![],
+            format: ModelFormat::default(),
+            num_attention_heads: None,
+            num_key_value_heads: None,
+            num_hidden_layers: None,
+            head_dim: None,
+            attention_layout: None,
+            hidden_size: None,
+            moe_intermediate_size: None,
+            vocab_size: None,
+            shared_expert_intermediate_size: None,
+            architecture: None,
+            license: None,
+        };
+
+        let caps = Capability::infer(&model);
+        assert!(caps.contains(&Capability::Audio));
+        assert!(caps.contains(&Capability::Tts));
     }
 
     #[test]
@@ -2544,6 +2954,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: attn_heads,
             num_key_value_heads: kv_heads,
@@ -2652,6 +3063,7 @@ mod tests {
             release_date: None,
             gguf_sources: vec![],
             capabilities: vec![],
+            languages: vec![],
             format: ModelFormat::default(),
             num_attention_heads: Some(32),
             num_key_value_heads: Some(8),
@@ -2944,6 +3356,28 @@ mod tests {
             assert!(
                 m.capabilities.contains(&Capability::Audio),
                 "Whisper model {:?} is missing Capability::Audio",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_embedded_database_includes_tts_models() {
+        let db = ModelDatabase::embedded();
+        let tts: Vec<_> = db
+            .get_all_models()
+            .iter()
+            .filter(|m| m.capabilities.contains(&Capability::Tts))
+            .collect();
+
+        assert!(
+            !tts.is_empty(),
+            "embedded database has no TTS models with Capability::Tts"
+        );
+        for m in &tts {
+            assert!(
+                m.capabilities.contains(&Capability::Audio),
+                "TTS model {:?} is missing broad Capability::Audio",
                 m.name
             );
         }

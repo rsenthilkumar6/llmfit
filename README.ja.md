@@ -973,6 +973,18 @@ cp -r skills/llmfit-advisor ~/.openclaw/skills/
 
 ---
 
+## コード署名
+
+llmfit の Windows リリースバイナリは [SignPath.io](https://about.signpath.io/) によりデジタル署名（Authenticode）されており、コード署名証明書は [SignPath Foundation](https://signpath.org/) から無償で提供されています。
+
+署名は[リリースパイプライン](.github/workflows/release.yml)で自動的に行われます。署名に提出されるのは GitHub Actions によって本リポジトリからビルドされた成果物のみで、署名リクエストはプロジェクトメンテナー（[@AlexsJones](https://github.com/AlexsJones)）が承認します。
+
+**コード署名ポリシー：**[SignPath Foundation のコード署名ポリシーと利用規約](https://signpath.org/terms)を参照してください。
+
+**プライバシー：**本プログラムは、ユーザーまたは本プログラムをインストール・操作する人が明示的に要求しない限り、他のネットワークシステムへ情報を送信することはありません。llmfit が外部サービスにアクセスするのは、該当機能（モデルのダウンロード、ランタイムプロバイダーへの問い合わせ、コミュニティリーダーボードなど）を明示的に使用した場合のみです。
+
+---
+
 ## ライセンス
 
 MIT

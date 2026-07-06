@@ -168,6 +168,12 @@ struct Cli {
     #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u32).range(1..))]
     max_context: Option<u32>,
 
+    /// Force the interactive TUI, ignoring any subcommand or output flags.
+    /// Useful in Docker where a baked-in CMD would otherwise run a subcommand:
+    /// docker run --rm -it ghcr.io/alexsjones/llmfit --tui
+    #[arg(long, global = true)]
+    tui: bool,
+
     /// Do not auto-start the background dashboard server
     #[arg(long, global = true)]
     no_dashboard: bool,
@@ -203,6 +209,76 @@ AGENT USAGE:
   JSON output fields: { system: { cpu, ram_gb, gpu_name, gpu_vram_gb,
   gpu_backend, unified_memory, os } }")]
     System,
+
+    /// Print a hardware diagnostic report for bug reports
+    #[command(long_about = "\
+Print a hardware diagnostic report for GitHub bug reports.
+
+Captures the raw output of every external tool GPU detection shells out to
+(nvidia-smi, rocm-smi, sysfs, lspci, system_profiler, WMI, vulkaninfo,
+npu-smi) alongside what llmfit actually detected, so detection bugs can be
+reproduced — and turned into regression tests — from the report alone.
+
+PRECONDITIONS:
+  None. Missing tools are reported as unavailable, which is itself useful.
+
+SIDE EFFECTS:
+  None — read-only. Output contains hardware model names and driver info
+  only; no hostnames, usernames, or serial numbers.
+
+EXIT CODES:
+  0  Success
+
+AGENT USAGE:
+  llmfit doctor > llmfit-doctor.md
+
+  Output is Markdown; attach or paste it into a GitHub issue.")]
+    Doctor,
+
+    /// Generate a Kubernetes DRA ResourceClaim encoding the model's fit
+    #[command(long_about = "\
+Generate a Kubernetes DRA ResourceClaim (or ResourceClaimTemplate) whose CEL
+selector encodes the model's fit inequality against attributes published by
+the llmfit.ai DRA driver (llmfit-dra). Constants (weights size, memory floor,
+bandwidth floor) are resolved from the model database and inlined; the YAML
+is printed on stdout with provenance comments.
+
+PRECONDITIONS:
+  None locally. Applying the output requires a cluster running llmfit-dra
+  (Kubernetes >= 1.34) with its shipped DeviceClasses.
+
+SIDE EFFECTS:
+  None — prints YAML; pipe to kubectl to apply.
+
+EXIT CODES:
+  0  Success
+  1  Unknown/ambiguous model, or invalid bounds
+
+AGENT USAGE:
+  llmfit claim qwen2.5-32b --min-tps 20 | kubectl apply -f -
+  llmfit claim mistral-7b --template > claim-template.yaml")]
+    Claim {
+        /// Model name (exact or unambiguous partial match)
+        model: String,
+        /// Minimum acceptable decode speed, tokens/second
+        #[arg(long, default_value_t = 20.0)]
+        min_tps: f64,
+        /// Override the database entry's quantization (e.g. Q4_K_M, Q8_0)
+        #[arg(long)]
+        quant: Option<String>,
+        /// Backend efficiency percentage used in the fit inequality
+        #[arg(long, default_value_t = 55)]
+        efficiency: u32,
+        /// DeviceClass the claim requests against
+        #[arg(long, default_value = "llmfit.ai")]
+        device_class: String,
+        /// Emit a ResourceClaimTemplate (for pod templates) instead of a ResourceClaim
+        #[arg(long)]
+        template: bool,
+        /// metadata.name for the generated object (default: derived from the model name)
+        #[arg(long)]
+        name: Option<String>,
+    },
 
     /// List all available LLM models
     #[command(long_about = "\
@@ -479,7 +555,7 @@ AGENT USAGE:
         #[arg(long, value_name = "RUNTIME")]
         force_runtime: Option<String>,
 
-        /// Filter by capability: vision, tool_use (comma-separated for multiple)
+        /// Filter by capability: vision, tool_use, audio, tts (comma-separated)
         #[arg(long, value_name = "CAPS")]
         capability: Option<String>,
 
@@ -681,6 +757,14 @@ AGENT USAGE:
         /// Port to listen on
         #[arg(long, default_value = "8787")]
         port: u16,
+
+        /// Listen on a Unix domain socket instead of TCP (unix platforms
+        /// only). Any stale socket file is replaced; the socket is created
+        /// with mode 0660. Intended for same-host/same-pod consumers (e.g.
+        /// the llmfit-dra DRA driver sidecar) where a TCP port on the host
+        /// network is undesirable.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["host", "port"])]
+        unix_socket: Option<std::path::PathBuf>,
 
         /// Run as MCP server on stdio instead of HTTP
         #[arg(long)]
@@ -1342,11 +1426,14 @@ fn run_recommend(
 
     // Filter by capability if specified
     if let Some(ref caps_str) = capability {
-        let requested: Vec<&str> = caps_str.split(',').map(|s| s.trim()).collect();
-        fits.retain(|f| {
-            requested
-                .iter()
-                .all(|req| match req.to_lowercase().as_str() {
+        let requested: Vec<String> = caps_str
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !requested.is_empty() {
+            fits.retain(|f| {
+                requested.iter().all(|req| match req.as_str() {
                     "vision" => f
                         .model
                         .capabilities
@@ -1355,9 +1442,18 @@ fn run_recommend(
                         .model
                         .capabilities
                         .contains(&llmfit_core::models::Capability::ToolUse),
-                    _ => true,
+                    "audio" => f
+                        .model
+                        .capabilities
+                        .contains(&llmfit_core::models::Capability::Audio),
+                    "tts" | "text-to-speech" | "text_to_speech" => f
+                        .model
+                        .capabilities
+                        .contains(&llmfit_core::models::Capability::Tts),
+                    _ => false,
                 })
-        });
+            });
+        }
     }
 
     // Filter by license if specified
@@ -2386,18 +2482,9 @@ fn display_routing_matrix_full(
     let total_tests: usize = results.iter().map(|r| r.roles.len()).sum();
 
     println!();
-    println!(
-        "{}",
-        "╔══════════════════════════════════════════════════════╗"
-    );
-    println!(
-        "{}",
-        "║                MODEL ROUTING MATRIX                  ║"
-    );
-    println!(
-        "{}",
-        "╚══════════════════════════════════════════════════════╝"
-    );
+    println!("╔══════════════════════════════════════════════════════╗");
+    println!("║                MODEL ROUTING MATRIX                  ║");
+    println!("╚══════════════════════════════════════════════════════╝");
     println!();
     println!(
         "Provider: {} • Models: {} • Roles: {} • Tests: {}",
@@ -2496,14 +2583,25 @@ fn main() {
         cpu_cores: cli.cpu_cores,
     };
     let auto_dashboard = !cli.no_dashboard
-        && !cli.json
-        && !matches!(cli.command.as_ref(), Some(Commands::Serve { .. }));
+        && (cli.tui
+            || (!cli.json && !matches!(cli.command.as_ref(), Some(Commands::Serve { .. }))));
 
     let _dashboard_guard = if auto_dashboard {
         ensure_dashboard_available(&overrides, context_limit)
     } else {
         None
     };
+
+    // --tui forces the interactive TUI regardless of any subcommand or
+    // output flags, so a Docker image with a baked-in CMD can still launch
+    // the TUI: docker run --rm -it ghcr.io/alexsjones/llmfit --tui
+    if cli.tui {
+        if let Err(e) = run_tui(&overrides, context_limit, cli.api_key) {
+            eprintln!("Error running TUI: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // If a subcommand is given, use classic CLI mode
     if let Some(command) = cli.command {
@@ -2514,6 +2612,53 @@ fn main() {
                     display::display_json_system(&specs);
                 } else {
                     specs.display();
+                }
+            }
+
+            Commands::Doctor => {
+                print!(
+                    "{}",
+                    llmfit_core::doctor::collect_diagnostics(env!("CARGO_PKG_VERSION"))
+                );
+            }
+
+            Commands::Claim {
+                model,
+                min_tps,
+                quant,
+                efficiency,
+                device_class,
+                template,
+                name,
+            } => {
+                let db = ModelDatabase::new();
+                let target = llmfit_core::claim::ClaimTarget {
+                    min_tps,
+                    efficiency_pct: efficiency,
+                    device_class,
+                    template,
+                    quant,
+                    name,
+                };
+                let rendered = resolve_model_selector(db.get_all_models(), &model).and_then(|m| {
+                    if cli.json {
+                        llmfit_core::claim::render_json(m, &target, env!("CARGO_PKG_VERSION"))
+                    } else {
+                        llmfit_core::claim::render(m, &target)
+                    }
+                });
+                match rendered {
+                    Ok(out) => {
+                        if cli.json {
+                            println!("{}", out)
+                        } else {
+                            print!("{}", out)
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("Error: {}", err);
+                        std::process::exit(1);
+                    }
                 }
             }
 
@@ -2703,6 +2848,7 @@ fn main() {
             Commands::Serve {
                 host,
                 port,
+                unix_socket,
                 mcp,
                 send_events,
                 nats_url,
@@ -2728,7 +2874,13 @@ fn main() {
                         eprintln!("NATS events enabled, publishing to {}", nats_url);
                     }
 
-                    if let Err(err) = serve_api::run_serve(&host, port, &overrides, context_limit) {
+                    if let Err(err) = serve_api::run_serve(
+                        &host,
+                        port,
+                        unix_socket.as_deref(),
+                        &overrides,
+                        context_limit,
+                    ) {
                         eprintln!("Error: {}", err);
                         std::process::exit(1);
                     }
@@ -2823,6 +2975,7 @@ mod tests {
                 release_date: Some("2025-01-01".to_string()),
                 gguf_sources: vec![],
                 capabilities: vec![],
+                languages: vec![],
                 format: llmfit_core::models::ModelFormat::default(),
                 num_attention_heads: None,
                 num_key_value_heads: None,
@@ -2857,6 +3010,7 @@ mod tests {
             installed: false,
             fits_with_turboquant: false,
             effective_context_length: 8192,
+            usable_context: 8192,
         }
     }
 
@@ -2909,6 +3063,7 @@ mod tests {
                 release_date: None,
                 gguf_sources: vec![],
                 capabilities: vec![],
+                languages: vec![],
                 format: llmfit_core::models::ModelFormat::default(),
                 num_attention_heads: None,
                 num_key_value_heads: None,
@@ -2940,6 +3095,7 @@ mod tests {
                 release_date: None,
                 gguf_sources: vec![],
                 capabilities: vec![],
+                languages: vec![],
                 format: llmfit_core::models::ModelFormat::default(),
                 num_attention_heads: None,
                 num_key_value_heads: None,
