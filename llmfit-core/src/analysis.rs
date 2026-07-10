@@ -150,6 +150,8 @@ pub fn build_model_fits(
     // Community-measured throughput for this hardware, when the detected GPU
     // matches a benchmark preset (provenance-weighted estimates).
     let measured_index = crate::benchmarks::MeasuredTpsIndex::for_specs(specs);
+    // The user's own `llmfit bench` runs trump community medians.
+    let local_index = crate::share::LocalBenchIndex::load();
 
     db.get_all_models()
         .iter()
@@ -158,9 +160,14 @@ pub fn build_model_fits(
             let mut fit =
                 ModelFit::analyze_with_forced_runtime(m, specs, context_limit, forced_runtime);
             fit.installed = installed.is_installed(&m.name);
-            fit.measured_tps = measured_index
+            fit.measured_tps = local_index
                 .as_ref()
-                .and_then(|idx| idx.lookup(&m.name, &fit.best_quant));
+                .and_then(|idx| idx.lookup(&m.name))
+                .or_else(|| {
+                    measured_index
+                        .as_ref()
+                        .and_then(|idx| idx.lookup(&m.name, &fit.best_quant))
+                });
             fit
         })
         .collect()

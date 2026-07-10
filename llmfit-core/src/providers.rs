@@ -3278,6 +3278,37 @@ pub fn ollama_pull_tag(hf_name: &str) -> Option<String> {
     lookup_ollama_tag(hf_name).map(|s| s.to_string())
 }
 
+/// Match a running provider's model tag (an Ollama-style id, or a GGUF file
+/// path/stem as reported by llama-server) against an HF-style model name,
+/// reusing the installed-column heuristics.
+///
+/// Two deliberately separate passes: Ollama-style candidate matching runs
+/// only against the verbatim id, while file paths (".../gemma-3.Q8_0.gguf")
+/// get exact stem matching only — feeding a bare stem into the Ollama
+/// candidate heuristics would match whole families.
+pub fn tag_matches_model(tag: &str, hf_name: &str) -> bool {
+    let lower = tag.to_lowercase();
+
+    let mut tag_set = HashSet::new();
+    tag_set.insert(lower.clone());
+    if is_model_installed(hf_name, &tag_set) {
+        return true;
+    }
+
+    let stem = lower
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&lower)
+        .trim_end_matches(".gguf")
+        .to_string();
+    let mut stem_set = HashSet::new();
+    if let Some(base) = strip_gguf_quant_suffix(&stem) {
+        stem_set.insert(base);
+    }
+    stem_set.insert(stem);
+    is_model_installed_llamacpp(hf_name, &stem_set)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

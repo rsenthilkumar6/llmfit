@@ -358,26 +358,7 @@ pub enum BenchOfferState {
 /// (".../gemma-3.Q8_0.gguf") get exact stem matching only — feeding a bare
 /// stem into the Ollama candidate heuristics would match whole families.
 fn bench_target_matches(target_model: &str, hf_name: &str) -> bool {
-    let lower = target_model.to_lowercase();
-
-    let mut tag_set = HashSet::new();
-    tag_set.insert(lower.clone());
-    if llmfit_core::providers::is_model_installed(hf_name, &tag_set) {
-        return true;
-    }
-
-    let stem = lower
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(&lower)
-        .trim_end_matches(".gguf")
-        .to_string();
-    let mut stem_set = HashSet::new();
-    if let Some(base) = llmfit_core::providers::strip_gguf_quant_suffix(&stem) {
-        stem_set.insert(base);
-    }
-    stem_set.insert(stem);
-    llmfit_core::providers::is_model_installed_llamacpp(hf_name, &stem_set)
+    llmfit_core::providers::tag_matches_model(target_model, hf_name)
 }
 
 /// Body of the bench-offer worker thread: find the selected model on a running
@@ -1191,6 +1172,8 @@ impl App {
 
         // Only analyze models that can actually run on this hardware.
         let measured_index = llmfit_core::benchmarks::MeasuredTpsIndex::for_specs(&specs);
+        // The user's own `llmfit bench` runs trump community medians.
+        let local_index = llmfit_core::share::LocalBenchIndex::load();
         let mut all_fits: Vec<ModelFit> = db
             .get_all_models()
             .iter()
@@ -1198,9 +1181,14 @@ impl App {
             .map(|m| {
                 let mut fit = ModelFit::analyze_with_context_limit(m, &specs, context_limit);
                 fit.installed = installed.is_installed(&m.name);
-                fit.measured_tps = measured_index
+                fit.measured_tps = local_index
                     .as_ref()
-                    .and_then(|idx| idx.lookup(&m.name, &fit.best_quant));
+                    .and_then(|idx| idx.lookup(&m.name))
+                    .or_else(|| {
+                        measured_index
+                            .as_ref()
+                            .and_then(|idx| idx.lookup(&m.name, &fit.best_quant))
+                    });
                 fit
             })
             .collect();
@@ -2498,8 +2486,25 @@ impl App {
         if finished {
             self.bench_offer_rx = None;
             // The worker stored (and possibly shared) a new local result —
-            // refresh the local rows pinned to the leaderboard behind the modal.
+            // refresh the local rows pinned to the leaderboard behind the
+            // modal and the measured tok/s shown in the main table.
             self.merge_local_bench_rows();
+            self.refresh_local_measured_tps();
+        }
+    }
+
+    /// Re-annotate fit rows with the latest local benchmark measurements so
+    /// the main table's tok/s column reflects a just-finished bench without a
+    /// restart. Only upgrades rows a local run matches; community-measured
+    /// values elsewhere are left alone.
+    pub fn refresh_local_measured_tps(&mut self) {
+        let Some(idx) = llmfit_core::share::LocalBenchIndex::load() else {
+            return;
+        };
+        for fit in &mut self.all_fits {
+            if let Some(m) = idx.lookup(&fit.model.name) {
+                fit.measured_tps = Some(m);
+            }
         }
     }
 

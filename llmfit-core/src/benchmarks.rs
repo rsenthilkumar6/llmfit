@@ -369,17 +369,33 @@ pub fn cached_preset_labels() -> Vec<&'static str> {
 
 // ── Measured throughput lookup (provenance-weighted estimates) ──────
 
-/// A real measured throughput from community benchmark runs on hardware
-/// matching the user's detected system. When present, this is ground truth
-/// and should be displayed with priority over the formula estimate.
+/// Where a measured throughput came from. The user's own benchmark runs
+/// outrank community medians, which outrank the formula estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasuredSource {
+    /// Community leaderboard runs on hardware matching the detected GPU.
+    #[default]
+    Community,
+    /// `llmfit bench` runs recorded in this machine's local store.
+    LocalBench,
+}
+
+/// A real measured throughput from benchmark runs — either the community
+/// leaderboard on matching hardware, or the user's own `llmfit bench` runs on
+/// this very machine. When present, this is ground truth and should be
+/// displayed with priority over the formula estimate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeasuredTps {
-    /// Median measured generation throughput (tok/s).
+    /// Measured generation throughput (tok/s): community median, or the most
+    /// recent local run.
     pub tok_s: f64,
-    /// Number of community runs behind the median.
+    /// Number of runs behind the value.
     pub sample_count: u32,
-    /// Hardware preset the runs come from (e.g. "RTX 3090 (24 GB)").
+    /// Hardware the runs come from (e.g. "RTX 3090 (24 GB)" or "this machine").
     pub hardware_label: String,
+    #[serde(default)]
+    pub source: MeasuredSource,
 }
 
 /// Find the embedded-cache hardware preset matching the detected GPU.
@@ -467,6 +483,7 @@ impl MeasuredTpsIndex {
             tok_s: median,
             sample_count: n as u32,
             hardware_label: self.hardware_label.to_string(),
+            source: MeasuredSource::Community,
         })
     }
 }

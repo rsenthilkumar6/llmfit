@@ -342,6 +342,54 @@ pub fn mark_shared(stored: &[StoredBenchmark]) {
     }
 }
 
+/// Index of the user's own benchmark runs (pending and shared), used to
+/// annotate fit rows: a throughput measured on THIS machine is ground truth
+/// and takes priority over community medians and formula estimates.
+pub struct LocalBenchIndex {
+    /// (provider model tag, tok/s), newest run first.
+    entries: Vec<(String, f64)>,
+}
+
+impl LocalBenchIndex {
+    /// Load every stored benchmark result. Returns `None` when the store is
+    /// empty so callers can skip per-model lookups entirely.
+    pub fn load() -> Option<Self> {
+        let mut entries: Vec<(String, f64)> = Vec::new();
+        for s in shared_benchmarks().into_iter().chain(pending_benchmarks()) {
+            let Some(results) = s.payload["results"].as_array() else {
+                continue;
+            };
+            for r in results {
+                if let (Some(model), Some(tps)) = (r["model"].as_str(), r["avgTps"].as_f64())
+                    && tps > 0.0
+                {
+                    entries.push((model.to_string(), tps));
+                }
+            }
+        }
+        // Store reads are oldest-first; prefer the newest measurement.
+        entries.reverse();
+        (!entries.is_empty()).then_some(Self { entries })
+    }
+
+    /// Most recent locally measured tok/s for a catalog model, if any stored
+    /// run's provider tag matches it.
+    pub fn lookup(&self, model_hf_name: &str) -> Option<crate::benchmarks::MeasuredTps> {
+        let matches: Vec<f64> = self
+            .entries
+            .iter()
+            .filter(|(tag, _)| crate::providers::tag_matches_model(tag, model_hf_name))
+            .map(|(_, tps)| *tps)
+            .collect();
+        Some(crate::benchmarks::MeasuredTps {
+            tok_s: *matches.first()?,
+            sample_count: matches.len() as u32,
+            hardware_label: "this machine".to_string(),
+            source: crate::benchmarks::MeasuredSource::LocalBench,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Orchestration
 // ---------------------------------------------------------------------------
@@ -1148,7 +1196,23 @@ mod tests {
         );
         assert!(shared_benchmarks().is_empty());
 
+        // The local index resolves the stored run for the matching catalog
+        // model (ollama tag "llama3.1:8b" ↔ HF-style name) and outranks
+        // nothing else: unknown models get no local measurement.
+        let idx = LocalBenchIndex::load().expect("store has one run");
+        let m = idx.lookup("test/llama-3.1-8b").expect("tag should match");
+        assert_eq!(m.tok_s, 128.44);
+        assert_eq!(m.sample_count, 1);
+        assert_eq!(m.source, crate::benchmarks::MeasuredSource::LocalBench);
+        assert!(idx.lookup("test/qwen2.5-7b").is_none());
+
         mark_shared(&pending);
+        // Shared runs still count as local measurements.
+        assert!(
+            LocalBenchIndex::load()
+                .and_then(|i| i.lookup("test/llama-3.1-8b"))
+                .is_some()
+        );
         assert!(pending_benchmarks().is_empty());
         let shared = shared_benchmarks();
         assert_eq!(shared.len(), 1);
