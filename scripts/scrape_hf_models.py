@@ -15,6 +15,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -923,6 +924,9 @@ def _detect_format_from_name(repo_id: str) -> tuple[str, str]:
 
 def scrape_model(repo_id: str) -> dict | None:
     """Scrape a single model and return an LlmModel-compatible dict."""
+    if is_test_stub(repo_id):
+        print(f"  ⚠ Skipping test stub {repo_id}", file=sys.stderr)
+        return None
     info = fetch_model_info(repo_id)
     if not info:
         return None
@@ -1305,6 +1309,20 @@ SKIP_ORGS = {
     "trl-internal-testing",   # Test fixtures
 }
 
+# Markers of CI/test-stub repos: randomly initialized micro-models that look
+# like real model families by name (e.g. `tiny-random/gemma-3` is 9M params).
+# They poison installed-detection and throughput estimates, so they never
+# belong in the catalog regardless of download counts.
+TEST_STUB_MARKERS = ("tiny-random", "tiny-dummy", "-random-init", "ci-random-")
+
+
+def is_test_stub(repo_id: str) -> bool:
+    rid = repo_id.lower()
+    if any(marker in rid for marker in TEST_STUB_MARKERS):
+        return True
+    name = rid.split("/")[-1]
+    return name.startswith(("test-", "testing-", "test_")) or bool(re.match(r"^test\d", name))
+
 # Sort strategies to query — results are merged and deduplicated.
 # Each strategy surfaces models that the others might miss.
 DISCOVER_SORT_STRATEGIES = [
@@ -1408,6 +1426,10 @@ def _process_listing(
         stats["skip_org"] += 1
         return None
 
+    if is_test_stub(repo_id):
+        stats["skip_test_stub"] += 1
+        return None
+
     downloads_raw = m.get("downloads")
     downloads = downloads_raw or 0
     if downloads < min_downloads and (require_downloads_floor or downloads_raw is not None):
@@ -1491,6 +1513,7 @@ def discover_trending_models(limit: int = 30, min_downloads: int = 10000) -> lis
         "skip_curated": 0,
         "skip_duplicate": 0,
         "skip_org": 0,
+        "skip_test_stub": 0,
         "skip_downloads": 0,
         "skip_tags": 0,
         "skip_no_params": 0,

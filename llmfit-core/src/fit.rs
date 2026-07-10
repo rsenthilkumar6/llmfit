@@ -225,6 +225,11 @@ pub struct EstimateBasis {
     /// The estimate models single-request *generation* throughput at this
     /// context length. Prompt processing (prefill/TTFT) is not estimated.
     pub assumed_context: u32,
+    /// Correction factor derived from the user's own `llmfit bench` runs on
+    /// this machine (median measured/estimated across trustworthy anchors),
+    /// already applied to `estimated_tps`. `None` when no local runs matched.
+    #[serde(default)]
+    pub local_calibration: Option<f64>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -586,6 +591,7 @@ impl ModelFit {
                     .then(|| ddr_bandwidth_gbps(&config)),
                 efficiency: config.efficiency,
                 assumed_context: estimation_ctx,
+                local_calibration: None,
             }
         };
 

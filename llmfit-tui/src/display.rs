@@ -576,6 +576,12 @@ fn display_estimate_basis(fit: &ModelFit) {
     }
 
     println!("{}", "Estimate Basis:".bold().underline());
+    if let Some(c) = basis.local_calibration {
+        println!(
+            "  Calibrated x{:.2} from your own `llmfit bench` run(s) on this machine",
+            c
+        );
+    }
     match basis.method.as_str() {
         "gpu_bandwidth_roofline" => {
             let bw = basis.gpu_bandwidth_gbps.unwrap_or(0.0);

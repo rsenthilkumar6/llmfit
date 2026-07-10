@@ -243,6 +243,22 @@ pub struct StoredBenchmark {
 }
 
 impl StoredBenchmark {
+    /// Whether this run was recorded on hardware matching `specs` (same CPU
+    /// and GPU). Measurements from a previous machine configuration must not
+    /// override or calibrate estimates for the current one.
+    pub fn matches_hardware(&self, specs: &SystemSpecs) -> bool {
+        let hw = &self.payload["hardware"];
+        let cpu_ok = hw["cpu"]
+            .as_str()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&specs.cpu_name));
+        let gpu_ok = match (&specs.gpu_name, hw["hardwareName"].as_str()) {
+            (Some(now), Some(then)) => now.eq_ignore_ascii_case(then),
+            (None, None) => true,
+            _ => false,
+        };
+        cpu_ok && gpu_ok
+    }
+
     /// One line per benchmark result: `model via provider — N tok/s`.
     pub fn result_lines(&self) -> Vec<String> {
         let Some(results) = self.payload["results"].as_array() else {
@@ -351,11 +367,15 @@ pub struct LocalBenchIndex {
 }
 
 impl LocalBenchIndex {
-    /// Load every stored benchmark result. Returns `None` when the store is
-    /// empty so callers can skip per-model lookups entirely.
-    pub fn load() -> Option<Self> {
+    /// Load every stored benchmark result recorded on hardware matching
+    /// `specs`. Returns `None` when nothing qualifies so callers can skip
+    /// per-model lookups entirely.
+    pub fn load(specs: &SystemSpecs) -> Option<Self> {
         let mut entries: Vec<(String, f64)> = Vec::new();
         for s in shared_benchmarks().into_iter().chain(pending_benchmarks()) {
+            if !s.matches_hardware(specs) {
+                continue;
+            }
             let Some(results) = s.payload["results"].as_array() else {
                 continue;
             };
@@ -1199,17 +1219,23 @@ mod tests {
         // The local index resolves the stored run for the matching catalog
         // model (ollama tag "llama3.1:8b" ↔ HF-style name) and outranks
         // nothing else: unknown models get no local measurement.
-        let idx = LocalBenchIndex::load().expect("store has one run");
+        let idx = LocalBenchIndex::load(&specs).expect("store has one run");
         let m = idx.lookup("test/llama-3.1-8b").expect("tag should match");
         assert_eq!(m.tok_s, 128.44);
         assert_eq!(m.sample_count, 1);
         assert_eq!(m.source, crate::benchmarks::MeasuredSource::LocalBench);
         assert!(idx.lookup("test/qwen2.5-7b").is_none());
 
+        // Runs recorded on different hardware never leak into the index.
+        let other_gpu = specs_with_gpu("NVIDIA GeForce RTX 3060");
+        assert!(LocalBenchIndex::load(&other_gpu).is_none());
+        assert!(!pending[0].matches_hardware(&other_gpu));
+        assert!(pending[0].matches_hardware(&specs));
+
         mark_shared(&pending);
         // Shared runs still count as local measurements.
         assert!(
-            LocalBenchIndex::load()
+            LocalBenchIndex::load(&specs)
                 .and_then(|i| i.lookup("test/llama-3.1-8b"))
                 .is_some()
         );

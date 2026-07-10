@@ -151,9 +151,10 @@ pub fn build_model_fits(
     // matches a benchmark preset (provenance-weighted estimates).
     let measured_index = crate::benchmarks::MeasuredTpsIndex::for_specs(specs);
     // The user's own `llmfit bench` runs trump community medians.
-    let local_index = crate::share::LocalBenchIndex::load();
+    let local_index = crate::share::LocalBenchIndex::load(specs);
 
-    db.get_all_models()
+    let mut fits: Vec<ModelFit> = db
+        .get_all_models()
         .iter()
         .filter(|m| backend_compatible(m, specs))
         .map(|m| {
@@ -170,5 +171,75 @@ pub fn build_model_fits(
                 });
             fit
         })
-        .collect()
+        .collect();
+    apply_local_calibration(&mut fits);
+    fits
+}
+
+/// Calibrate formula estimates from the user's own benchmark runs.
+///
+/// Anchors are fits whose `measured_tps` came from the local store and whose
+/// catalog entry has a trustworthy size (>= 1B params, dense — MoE and tiny
+/// models don't scale like bandwidth-bound dense generation). The median
+/// measured/estimated ratio, clamped to [0.05, 3.0], scales every row's
+/// estimate and is recorded in `estimate_basis.local_calibration`.
+///
+/// Idempotent: ratios and scaling always derive from the uncalibrated
+/// estimate, so re-applying after a new bench never compounds.
+pub fn apply_local_calibration(fits: &mut [ModelFit]) {
+    use crate::benchmarks::MeasuredSource;
+
+    fn uncalibrated(f: &ModelFit) -> f64 {
+        match f.estimate_basis.local_calibration {
+            Some(c) if c > 0.0 => f.estimated_tps / c,
+            _ => f.estimated_tps,
+        }
+    }
+
+    let mut ratios: Vec<f64> = fits
+        .iter()
+        .filter(|f| f.model.params_b() >= 1.0 && !f.model.is_moe)
+        .filter_map(|f| {
+            let m = f.measured_tps.as_ref()?;
+            if m.source != MeasuredSource::LocalBench {
+                return None;
+            }
+            let est = uncalibrated(f);
+            (est > 0.0 && m.tok_s > 0.0).then(|| m.tok_s / est)
+        })
+        .collect();
+    if ratios.is_empty() {
+        return;
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).expect("ratios are finite"));
+    let factor = median(&ratios).clamp(0.05, 3.0);
+
+    for f in fits.iter_mut() {
+        if f.estimated_tps <= 0.0 {
+            continue;
+        }
+        f.estimated_tps = uncalibrated(f) * factor;
+        f.estimate_basis.local_calibration = Some(factor);
+    }
+}
+
+fn median(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::*;
+
+    #[test]
+    fn median_of_sorted() {
+        assert_eq!(median(&[0.1]), 0.1);
+        assert_eq!(median(&[0.1, 0.3]), 0.2);
+        assert_eq!(median(&[0.1, 0.2, 0.9]), 0.2);
+    }
 }

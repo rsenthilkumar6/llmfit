@@ -1173,7 +1173,7 @@ impl App {
         // Only analyze models that can actually run on this hardware.
         let measured_index = llmfit_core::benchmarks::MeasuredTpsIndex::for_specs(&specs);
         // The user's own `llmfit bench` runs trump community medians.
-        let local_index = llmfit_core::share::LocalBenchIndex::load();
+        let local_index = llmfit_core::share::LocalBenchIndex::load(&specs);
         let mut all_fits: Vec<ModelFit> = db
             .get_all_models()
             .iter()
@@ -1192,6 +1192,9 @@ impl App {
                 fit
             })
             .collect();
+
+        // Calibrate formula estimates from the user's own benchmark runs.
+        llmfit_core::analysis::apply_local_calibration(&mut all_fits);
 
         // Sort by fit level then RAM usage
         all_fits = llmfit_core::fit::rank_models_by_fit(all_fits);
@@ -2496,16 +2499,19 @@ impl App {
     /// Re-annotate fit rows with the latest local benchmark measurements so
     /// the main table's tok/s column reflects a just-finished bench without a
     /// restart. Only upgrades rows a local run matches; community-measured
-    /// values elsewhere are left alone.
+    /// values elsewhere are left alone. Estimate calibration is then
+    /// recomputed (idempotently) from the updated anchors.
     pub fn refresh_local_measured_tps(&mut self) {
-        let Some(idx) = llmfit_core::share::LocalBenchIndex::load() else {
-            return;
-        };
-        for fit in &mut self.all_fits {
-            if let Some(m) = idx.lookup(&fit.model.name) {
-                fit.measured_tps = Some(m);
+        // Same specs the fits were built with: under simulated hardware the
+        // stored runs won't match, so simulated estimates stay untouched.
+        if let Some(idx) = llmfit_core::share::LocalBenchIndex::load(&self.specs) {
+            for fit in &mut self.all_fits {
+                if let Some(m) = idx.lookup(&fit.model.name) {
+                    fit.measured_tps = Some(m);
+                }
             }
         }
+        llmfit_core::analysis::apply_local_calibration(&mut self.all_fits);
     }
 
     /// Rebuild the "your local results" rows pinned at the top of the
