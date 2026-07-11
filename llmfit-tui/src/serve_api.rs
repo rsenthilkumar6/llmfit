@@ -184,29 +184,10 @@ pub fn run_serve(
                         if let Some(parent) = path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        // A stale socket from a previous instance blocks bind
+                        // A stale file from a previous instance blocks bind
                         // (the path can outlive the process, e.g. a pod
                         // volume across container restarts).
-                        match std::fs::symlink_metadata(path) {
-                            Ok(metadata) => {
-                                use std::os::unix::fs::FileTypeExt;
-                                if metadata.file_type().is_socket() {
-                                    let _ = std::fs::remove_file(path);
-                                } else {
-                                    return Err(ApiError::bad_request(format!(
-                                        "{} exists and is not a unix socket",
-                                        path.display()
-                                    )));
-                                }
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => {
-                                return Err(ApiError::internal(format!(
-                                    "failed to inspect {}: {e}",
-                                    path.display()
-                                )));
-                            }
-                        }
+                        let _ = std::fs::remove_file(path);
                         let listener = tokio::net::UnixListener::bind(path).map_err(|e| {
                             ApiError::internal(format!("bind failed on {}: {e}", path.display()))
                         })?;
@@ -214,10 +195,6 @@ pub fn run_serve(
                         use std::os::unix::fs::PermissionsExt;
                         let _ =
                             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
-                        let app = app.layer(axum::Extension(ConnectInfo(SocketAddr::from((
-                            [127, 0, 0, 1],
-                            0,
-                        )))));
                         axum::serve(listener, app.into_make_service())
                             .with_graceful_shutdown(async {
                                 let _ = tokio::signal::ctrl_c().await;

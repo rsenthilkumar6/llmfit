@@ -2314,12 +2314,12 @@ fn share_pending_cli(opts: &share::ShareOptions, token: Option<String>) {
                 );
             }
             match (&outcome.pr_url, outcome.reused_existing_pr) {
-                (Some(url), true) => eprintln!(
+                (Some(url), true) => println!(
                     "\n  Added {} submission(s) to your open pull request: {url}",
                     outcome.uploaded
                 ),
-                (Some(url), false) => eprintln!("\n  Pull request opened: {url}"),
-                (None, _) => eprintln!(
+                (Some(url), false) => println!("\n  Pull request opened: {url}"),
+                (None, _) => println!(
                     "\n  All stored results were already contributed upstream — nothing new to submit."
                 ),
             }

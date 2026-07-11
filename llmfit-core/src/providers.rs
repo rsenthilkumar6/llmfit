@@ -1771,14 +1771,6 @@ impl LmStudioProvider {
         )
     }
 
-    fn download_status_url(&self, job_id: &str) -> String {
-        format!(
-            "{}/api/v1/models/download/status/{}",
-            self.base_url.trim_end_matches('/'),
-            job_id
-        )
-    }
-
     /// Single-pass startup probe.
     /// Returns `(available, installed_models, count)`.
     pub fn detect_with_installed(&self) -> (bool, HashSet<String>, usize) {
@@ -1831,6 +1823,13 @@ struct LmStudioModel {
     id: String,
 }
 
+fn lmstudio_download_status_url(base_url: &str, job_id: &str) -> String {
+    format!(
+        "{}/api/v1/models/download/status/{job_id}",
+        base_url.trim_end_matches('/')
+    )
+}
+
 #[derive(serde::Deserialize)]
 struct LmStudioDownloadResponse {
     #[serde(default)]
@@ -1881,6 +1880,15 @@ fn lmstudio_download_terminal_status(status: &str) -> Option<LmStudioDownloadTer
     }
 }
 
+fn lmstudio_empty_status_limit_reached(status: &str, empty_statuses: &mut usize) -> bool {
+    if status.is_empty() {
+        *empty_statuses += 1;
+    } else {
+        *empty_statuses = 0;
+    }
+    *empty_statuses >= 3
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum LmStudioStatusPollResult {
     Finished,
@@ -1892,14 +1900,16 @@ fn poll_lmstudio_download_status(
     api_key: Option<&str>,
     tx: &std::sync::mpsc::Sender<PullEvent>,
     poll_interval: std::time::Duration,
-    max_polls: usize,
+    poll_budget: &mut usize,
 ) -> LmStudioStatusPollResult {
     let _ = tx.send(PullEvent::Progress {
         status: "Downloading via LM Studio (tracking status)...".to_string(),
         percent: None,
     });
 
-    for _ in 0..max_polls {
+    let mut empty_statuses = 0;
+    while *poll_budget > 0 {
+        *poll_budget -= 1;
         std::thread::sleep(poll_interval);
 
         let mut req = ureq::get(status_url)
@@ -1916,6 +1926,10 @@ fn poll_lmstudio_download_status(
         let Ok(st) = resp.into_body().read_json::<LmStudioDownloadStatus>() else {
             return LmStudioStatusPollResult::Fallback;
         };
+
+        if lmstudio_empty_status_limit_reached(&st.status, &mut empty_statuses) {
+            return LmStudioStatusPollResult::Fallback;
+        }
 
         match lmstudio_download_terminal_status(&st.status) {
             Some(LmStudioDownloadTerminalStatus::Done) => {
@@ -2028,10 +2042,7 @@ impl ModelProvider for LmStudioProvider {
     fn start_pull(&self, model_tag: &str) -> Result<PullHandle, String> {
         let download_url = self.download_url();
         let models_url = self.models_url();
-        let status_url_builder = LmStudioProvider {
-            base_url: self.base_url.clone(),
-            api_key: None,
-        };
+        let base_url = self.base_url.clone();
         let api_key = self.api_key.clone();
         let tag = match lmstudio_pull_tag(model_tag) {
             Some(t) => t,
@@ -2163,16 +2174,16 @@ impl ModelProvider for LmStudioProvider {
                         // per-job status when possible; otherwise fall back
                         // to the installed models list to detect completion.
                         let poll_interval = std::time::Duration::from_secs(3);
-                        let max_polls = 600; // 30 minutes max
+                        let mut poll_budget = 600; // 30 minutes max
 
                         if let Some(ref job_id) = job_id {
-                            let status_url = status_url_builder.download_status_url(job_id);
+                            let status_url = lmstudio_download_status_url(&base_url, job_id);
                             if poll_lmstudio_download_status(
                                 &status_url,
                                 api_key.as_deref(),
                                 &tx,
                                 poll_interval,
-                                max_polls,
+                                &mut poll_budget,
                             ) == LmStudioStatusPollResult::Finished
                             {
                                 return;
@@ -2185,7 +2196,7 @@ impl ModelProvider for LmStudioProvider {
                             &model_tag_owned,
                             &tx,
                             poll_interval,
-                            max_polls,
+                            poll_budget,
                         );
                     }
                 }
@@ -3668,21 +3679,13 @@ mod tests {
 
     #[test]
     fn test_lmstudio_download_status_url_formats_base_urls() {
-        let default_provider = LmStudioProvider {
-            base_url: "http://127.0.0.1:1234".to_string(),
-            api_key: None,
-        };
         assert_eq!(
-            default_provider.download_status_url("abc123"),
+            lmstudio_download_status_url("http://127.0.0.1:1234", "abc123"),
             "http://127.0.0.1:1234/api/v1/models/download/status/abc123"
         );
 
-        let custom_provider = LmStudioProvider {
-            base_url: "http://lmstudio.example.test:4321/".to_string(),
-            api_key: None,
-        };
         assert_eq!(
-            custom_provider.download_status_url("job-42"),
+            lmstudio_download_status_url("http://lmstudio.example.test:4321/", "job-42"),
             "http://lmstudio.example.test:4321/api/v1/models/download/status/job-42"
         );
     }
@@ -3717,20 +3720,30 @@ mod tests {
             lmstudio_download_terminal_status("failed"),
             Some(LmStudioDownloadTerminalStatus::Failed)
         );
+
+        let mut empty_statuses = 0;
+        for expected in [false, false, true] {
+            assert_eq!(
+                lmstudio_empty_status_limit_reached("", &mut empty_statuses),
+                expected
+            );
+        }
     }
 
     #[test]
     fn test_lmstudio_status_poll_error_falls_back_without_error() {
         let (tx, rx) = std::sync::mpsc::channel();
+        let mut poll_budget = 1;
         let result = poll_lmstudio_download_status(
             "http://127.0.0.1:1/api/v1/models/download/status/abc123",
             None,
             &tx,
             std::time::Duration::from_millis(0),
-            1,
+            &mut poll_budget,
         );
 
         assert_eq!(result, LmStudioStatusPollResult::Fallback);
+        assert_eq!(poll_budget, 0);
         assert!(
             !rx.try_iter()
                 .any(|event| matches!(event, PullEvent::Error(_))),
