@@ -17,7 +17,9 @@
   <a href="https://about.signpath.io"><img src="https://img.shields.io/badge/SignPath-signed-brightgreen?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0id2hpdGUiIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggZD0iTTEwLjA2NyA0LjU2N2wtNC43MzQgNC43MzMtMS40LTEuNGExIDEgMCAwIDAtMS40MTQgMS40MTRsMi4xIDIuMWExIDEgMCAwIDAgMS40MTQgMGw1LjQ0LTUuNDRhMSAxIDAgMCAwLTEuNDE0LTEuNDE0eiIvPjwvc3ZnPg==" alt="SignPath で署名済み"></a>
 </p>
 
-> **新機能: [コミュニティリーダーボード](#コミュニティリーダーボード-b)** — 実際のユーザーから集まった実環境のパフォーマンスデータを閲覧できます。`b` を押すと、自分のものに限らず、あらゆる GPU の実測 tok/s、TTFT、VRAM を確認できます。`H` で 27 種類以上のハードウェアプリセット（RTX 5090 から Apple M1 まで）から選び、購入や自作の前に実数値を比較しましょう。
+> **📊 新機能：ベンチマーク＆共有 — あなたのマシンの実測値が、みんなの推定精度を高めます。** `llmfit bench --share` はあなたのハードウェアで実際の tok/s を計測し、PR としてプロジェクトに還元します — `gh` CLI もサードパーティのアカウントも不要です。実行結果はまずローカルに保存され（共有をスキップして、後からまとめてアップロードも可能）、自分の実測値はフィットテーブルの推定値を置き換えます。マージされた提出は次のリリースに同梱され、同一ハードウェアのユーザーはベンチマークを実行する前から実測 `✓` 値と校正済みの推定値を得られます。[共有をはじめる →](docs/cli.md#contributing-benchmarks-bench---share)
+>
+> *これまで：[llmfit 1.0 — すべての数値が検証可能になったリリース →](https://github.com/AlexsJones/llmfit/discussions/708)*
 
 **数百のモデルとプロバイダー。自分のハードウェアで動くものを見つけるコマンドはひとつ。**
 

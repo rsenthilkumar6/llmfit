@@ -8,12 +8,17 @@
       "tag-separator": "",
       "include-v-in-tag": true,
       "changelog-path": "CHANGELOG.md",
-      "versioning": "default",
+      "versioning": "always-bump-patch",
       "extra-files": [
         {
           "type": "toml",
           "path": "Cargo.toml",
           "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "llmfit-tui/Cargo.toml",
+          "jsonpath": "$.dependencies.llmfit-core.version"
         }
       ]
     }

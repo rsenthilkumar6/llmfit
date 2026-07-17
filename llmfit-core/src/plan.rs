@@ -880,6 +880,7 @@ mod tests {
             has_gpu: true,
             gpu_vram_gb: Some(12.0),
             total_gpu_vram_gb: Some(12.0),
+            gpu_available_gb: None,
             gpu_name: Some("Test GPU".to_string()),
             gpu_count: 1,
             unified_memory: false,

@@ -99,6 +99,7 @@ Example response shape:
     "cpu_name": "Intel(R) Core(TM) Ultra 7 165U",
     "has_gpu": false,
     "gpu_vram_gb": null,
+    "gpu_available_gb": null,
     "gpu_name": null,
     "gpu_count": 0,
     "unified_memory": false,

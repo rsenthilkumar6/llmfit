@@ -12,9 +12,9 @@ use ratatui::{
 use crate::download_history::DownloadResult;
 use crate::theme::ThemeColors;
 use crate::tui_app::{
-    AdvConfigField, App, AvailabilityFilter, BenchViewMode, DL_DOCKER, DL_LLAMACPP, DL_LMSTUDIO,
-    DL_OLLAMA, DL_VLLM, DownloadCapability, DownloadManagerFocus, DownloadProvider, FitFilter,
-    InputMode, PlanField, SimulationField,
+    AdvConfigField, App, AvailabilityFilter, BenchOfferState, BenchViewMode, DL_DOCKER,
+    DL_LLAMACPP, DL_LMSTUDIO, DL_OLLAMA, DL_VLLM, DownloadCapability, DownloadManagerFocus,
+    DownloadProvider, FitFilter, InputMode, PlanField, SimulationField,
 };
 use llmfit_core::fit::{FitLevel, ModelFit, SortColumn};
 use llmfit_core::hardware::is_running_in_wsl;
@@ -92,6 +92,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_advanced_config_popup(frame, app, &tc);
     } else if app.input_mode == InputMode::FilterPopup {
         draw_filter_popup(frame, app, &tc);
+    } else if app.input_mode == InputMode::BenchOffer {
+        draw_bench_offer_popup(frame, app, &tc);
     }
 }
 
@@ -102,12 +104,14 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         let primary = &app.specs.gpus[0];
         let backend = primary.backend.label();
         let primary_str = if primary.unified_memory {
-            format!(
-                "{} ({:.1} GB shared, {})",
-                primary.name,
-                primary.vram_gb.unwrap_or(0.0),
-                backend
-            )
+            let shared = primary.vram_gb.unwrap_or(0.0);
+            match app.specs.gpu_available_gb {
+                Some(available) => format!(
+                    "{} ({:.1} GB GPU-available / {:.1} GB shared, {})",
+                    primary.name, available, shared, backend
+                ),
+                None => format!("{} ({:.1} GB shared, {})", primary.name, shared, backend),
+            }
         } else {
             match primary.vram_gb {
                 Some(vram) if vram > 0.0 => {
@@ -135,11 +139,15 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     let ollama_info = if app.ollama_available {
         format!("Ollama: ✓ ({} installed)", app.installed.ollama_count)
+    } else if app.ollama_binary_available {
+        "Ollama: installed (not running)".to_string()
     } else {
         "Ollama: ✗".to_string()
     };
     let ollama_color = if app.ollama_available {
         tc.good
+    } else if app.ollama_binary_available {
+        tc.warning
     } else {
         tc.muted
     };
@@ -180,22 +188,30 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
 
     let docker_mr_info = if app.docker_mr_available {
         format!("Docker: ✓ ({} models)", app.installed.docker_mr_count)
+    } else if app.docker_desktop_installed {
+        "Docker: installed (not running)".to_string()
     } else {
         "Docker: ✗".to_string()
     };
     let docker_mr_color = if app.docker_mr_available {
         tc.good
+    } else if app.docker_desktop_installed {
+        tc.warning
     } else {
         tc.muted
     };
 
     let lmstudio_info = if app.lmstudio_available {
         format!("LM Studio: ✓ ({} models)", app.installed.lmstudio_count)
+    } else if app.lmstudio_app_installed {
+        "LM Studio: installed (server off)".to_string()
     } else {
         "LM Studio: ✗".to_string()
     };
     let lmstudio_color = if app.lmstudio_available {
         tc.good
+    } else if app.lmstudio_app_installed {
+        tc.warning
     } else {
         tc.muted
     };
@@ -206,6 +222,17 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         "vLLM: ✗".to_string()
     };
     let vllm_color = if app.vllm_available {
+        tc.good
+    } else {
+        tc.muted
+    };
+
+    let ramalama_info = if app.ramalama_available {
+        format!("RamaLama: ✓ ({} models)", app.installed.ramalama_count)
+    } else {
+        "RamaLama: ✗".to_string()
+    };
+    let ramalama_color = if app.ramalama_available {
         tc.good
     } else {
         tc.muted
@@ -256,6 +283,8 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         Span::styled(lmstudio_info, Style::default().fg(lmstudio_color)),
         Span::styled("  │  ", Style::default().fg(tc.muted)),
         Span::styled(vllm_info, Style::default().fg(vllm_color)),
+        Span::styled("  │  ", Style::default().fg(tc.muted)),
+        Span::styled(ramalama_info, Style::default().fg(ramalama_color)),
     ];
 
     if app.backend_hidden_count > 0 {
@@ -412,7 +441,8 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         | InputMode::AdvancedConfig
         | InputMode::DownloadManager
         | InputMode::FilterPopup
-        | InputMode::Benchmarks => Style::default().fg(tc.muted),
+        | InputMode::Benchmarks
+        | InputMode::BenchOffer => Style::default().fg(tc.muted),
     };
 
     let search_inner_width = chunks[0].width.saturating_sub(2) as usize;
@@ -809,14 +839,20 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
                 tc.score_low
             };
 
-            #[allow(clippy::if_same_then_else)]
-            let tps_text = if fit.estimated_tps >= 100.0 {
-                format!("{:.0}", fit.estimated_tps)
-            } else if fit.estimated_tps >= 10.0 {
-                format!("{:.1}", fit.estimated_tps)
-            } else {
-                format!("{:.1}", fit.estimated_tps)
+            // Community-measured tok/s (marked ✓) takes priority over the
+            // formula estimate when matching hardware data exists.
+            let (tps_value, tps_measured) = match &fit.measured_tps {
+                Some(m) => (m.tok_s, true),
+                None => (fit.estimated_tps, false),
             };
+            let mut tps_text = if tps_value >= 100.0 {
+                format!("{:.0}", tps_value)
+            } else {
+                format!("{:.1}", tps_value)
+            };
+            if tps_measured {
+                tps_text.push('✓');
+            }
 
             let is_pulling = app.pull_active.is_some()
                 && app.pull_model_name.as_deref() == Some(&fit.model.name);
@@ -3042,6 +3078,10 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             " ↑/k:up  ↓/j:down  H:change GPU  r:refresh  b/q/Esc:close".to_string(),
             "COMMUNITY LEADERBOARD".to_string(),
         ),
+        InputMode::BenchOffer => (
+            " Enter:run  Space:share toggle  Esc:skip".to_string(),
+            "BENCHMARK".to_string(),
+        ),
     }
 }
 
@@ -3363,6 +3403,166 @@ fn draw_params_bucket_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         );
 
     let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, popup_area);
+}
+
+fn draw_bench_offer_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
+    let area = frame.area();
+
+    let popup_width = 64.min(area.width.saturating_sub(4));
+    let popup_height = 14.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Model:    ", Style::default().fg(tc.muted)),
+            Span::styled(
+                app.bench_offer_model.clone(),
+                Style::default().fg(tc.fg).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Provider: ", Style::default().fg(tc.muted)),
+            Span::styled(
+                app.bench_offer_providers.join(", "),
+                Style::default().fg(tc.fg),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    match app.bench_offer_state {
+        BenchOfferState::Offer => {
+            if let Some(reason) = &app.bench_offer_share_unavailable {
+                lines.push(Line::from(vec![
+                    Span::styled("  [-] ", Style::default().fg(tc.muted)),
+                    Span::styled("Share with llmfit ", Style::default().fg(tc.muted)),
+                    Span::styled(
+                        format!("(unavailable: {reason})"),
+                        Style::default().fg(tc.warning),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    "      Results are saved locally for sharing later",
+                    Style::default().fg(tc.muted),
+                )));
+            } else {
+                let (mark, mark_style) = if app.bench_offer_share {
+                    (
+                        "[x]",
+                        Style::default().fg(tc.good).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    ("[ ]", Style::default().fg(tc.muted))
+                };
+                let desc = if app.bench_offer_pending > 0 {
+                    format!(
+                        "(one PR: this run + {} stored local result(s))",
+                        app.bench_offer_pending
+                    )
+                } else {
+                    "(opens a PR with your results)".to_string()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {mark} "), mark_style),
+                    Span::styled("Share with llmfit ", Style::default().fg(tc.fg)),
+                    Span::styled(desc, Style::default().fg(tc.muted)),
+                ]));
+                if !app.bench_offer_share {
+                    lines.push(Line::from(Span::styled(
+                        "      Off: results are saved locally for sharing later",
+                        Style::default().fg(tc.muted),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Enter] Run   [Space] Toggle share   [Esc] Skip",
+                Style::default().fg(tc.muted),
+            )));
+        }
+        BenchOfferState::Running => {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", app.bench_offer_progress),
+                Style::default().fg(tc.info),
+            )));
+            if let Some((code, url)) = &app.bench_offer_auth {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  Authorize on GitHub to share:",
+                    Style::default().fg(tc.fg),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("    Open ", Style::default().fg(tc.muted)),
+                    Span::styled(url.clone(), Style::default().fg(tc.accent)),
+                    Span::styled("  and enter code ", Style::default().fg(tc.muted)),
+                    Span::styled(
+                        code.clone(),
+                        Style::default().fg(tc.accent).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Esc] Continue in background",
+                Style::default().fg(tc.muted),
+            )));
+        }
+        BenchOfferState::Done => {
+            if let Some(summary) = &app.bench_offer_summary {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", summary),
+                    Style::default().fg(tc.good),
+                )));
+            }
+            if let Some(url) = &app.bench_offer_pr_url {
+                lines.push(Line::from(vec![
+                    Span::styled("  Results PR: ", Style::default().fg(tc.fg)),
+                    Span::styled(url.clone(), Style::default().fg(tc.accent)),
+                ]));
+            }
+            if let Some(note) = &app.bench_offer_share_note {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", note),
+                    Style::default().fg(tc.warning),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Enter] Continue to leaderboard",
+                Style::default().fg(tc.muted),
+            )));
+        }
+        BenchOfferState::Error => {
+            if let Some(e) = &app.bench_offer_error {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", e),
+                    Style::default().fg(tc.error),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Enter] Continue to leaderboard",
+                Style::default().fg(tc.muted),
+            )));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tc.border))
+        .title(Span::styled(
+            " Benchmark this model ",
+            Style::default().fg(tc.title).add_modifier(Modifier::BOLD),
+        ));
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup_area);
 }
 
@@ -3748,7 +3948,7 @@ fn draw_advanced_config_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     let area = frame.area();
 
     let popup_width = 52u16.min(area.width.saturating_sub(4));
-    let popup_height = 16u16.min(area.height.saturating_sub(4));
+    let popup_height = 17u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -3806,6 +4006,11 @@ fn draw_advanced_config_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
             &app.adv_config_context_cap_input,
             AdvConfigField::ContextCap,
         ),
+        (
+            "  DDR GB/s:",
+            &app.adv_config_ddr_bandwidth_input,
+            AdvConfigField::DdrBandwidth,
+        ),
     ];
 
     let mut lines: Vec<Line> = Vec::new();
@@ -3854,6 +4059,7 @@ fn draw_advanced_config_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         AdvConfigField::FactorTp => 5,
         AdvConfigField::FactorCpuOnly => 6,
         AdvConfigField::ContextCap => 7,
+        AdvConfigField::DdrBandwidth => 8,
     };
     let cursor_x = inner.x + 14 + app.adv_config_cursor_position as u16;
     let cursor_y = inner.y + field_row;
@@ -4168,7 +4374,11 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
         return;
     }
 
-    if let Some(ref err) = app.bench_error {
+    // Full-page error only when there is nothing to show — cached data and
+    // locally stored results still render, with the error in the summary line.
+    if let Some(ref err) = app.bench_error
+        && app.bench_entries.is_empty()
+    {
         let err_text = Paragraph::new(vec![
             Line::from(Span::styled(
                 "  Failed to fetch benchmarks:",
@@ -4217,15 +4427,37 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
             .unwrap_or(&app.specs.cpu_name)
             .to_string()
     };
-    let summary = Line::from(vec![
+    let local_count = app
+        .bench_entries
+        .iter()
+        .filter(|e| e.id.starts_with("local:"))
+        .count();
+    let community_count = app
+        .bench_entries
+        .iter()
+        .filter(|e| e.id.starts_with("community:"))
+        .count();
+    let mut counts = format!("  ({} results", app.bench_total);
+    if local_count > 0 {
+        counts.push_str(&format!(", {} yours", local_count));
+    }
+    if community_count > 0 {
+        counts.push_str(&format!(", {} llmfit community", community_count));
+    }
+    counts.push(')');
+    let mut summary_spans = vec![
         Span::styled("  Hardware: ", Style::default().fg(tc.muted)),
         Span::styled(&hw_desc, Style::default().fg(tc.fg).bold()),
-        Span::styled(
-            format!("  ({} results)", app.bench_total),
-            Style::default().fg(tc.muted),
-        ),
+        Span::styled(counts, Style::default().fg(tc.muted)),
         Span::styled("  H:change GPU", Style::default().fg(tc.accent)),
-    ]);
+    ];
+    if let Some(ref err) = app.bench_error {
+        summary_spans.push(Span::styled(
+            format!("  ⚠ {}", err),
+            Style::default().fg(tc.warning),
+        ));
+    }
+    let summary = Line::from(summary_spans);
 
     // Table header
     let header_cells = [
@@ -4291,6 +4523,8 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
                 .map(|v| format!("{}", v))
                 .unwrap_or_default();
 
+            let is_local = entry.id.starts_with("local:");
+            let is_community = entry.id.starts_with("community:");
             let verified_marker = if entry.verified() { " *" } else { "" };
             let user = format!("{}{}", entry.username(), verified_marker);
 
@@ -4312,7 +4546,16 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
                 Cell::from(ttft),
                 Cell::from(vram),
                 Cell::from(ctx),
-                Cell::from(user),
+                if is_local {
+                    // Your own stored results, pinned above the fetched board.
+                    Cell::from(user).style(Style::default().fg(tc.accent))
+                } else if is_community {
+                    // Repo-contributed runs on identical hardware, shipped
+                    // inside this build.
+                    Cell::from(user).style(Style::default().fg(tc.info))
+                } else {
+                    Cell::from(user)
+                },
             ])
             .style(style)
         })
@@ -4423,11 +4666,11 @@ fn draw_bench_hw_picker(frame: &mut Frame, app: &App, tc: &ThemeColors) {
 }
 
 fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
-    use crate::tui_app::{FilterPopupField, FitFilter};
+    use crate::tui_app::{AvailabilityFilter, FilterPopupField, FitFilter};
 
     let area = frame.area();
     let popup_width = 56u16.min(area.width.saturating_sub(4));
-    let popup_height = 18u16.min(area.height.saturating_sub(4));
+    let popup_height = 21u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -4578,6 +4821,33 @@ fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         Span::styled(format!(" {:>12}", app.fit_filter.label()), fit_val_style),
     ]));
 
+    lines.push(Line::from(""));
+
+    // Availability Filter (installed / GGUF-available)
+    lines.push(Line::from(Span::styled(
+        "  Availability:",
+        Style::default().fg(tc.accent).bold(),
+    )));
+
+    let is_avail = app.filter_field == FilterPopupField::Availability;
+    let avail_color = match app.availability_filter {
+        AvailabilityFilter::All => tc.fg,
+        AvailabilityFilter::HasGguf => tc.info,
+        AvailabilityFilter::Installed => tc.good,
+    };
+    let avail_val_style = if is_avail {
+        Style::default().fg(avail_color).bg(tc.highlight_bg)
+    } else {
+        Style::default().fg(avail_color)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("    Show:", label_style(is_avail)),
+        Span::styled(
+            format!(" {:>12}", app.availability_filter.label()),
+            avail_val_style,
+        ),
+    ]));
+
     // Footer
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -4593,7 +4863,8 @@ fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
     //  0: "Parameters (B):"    1: Min  2: Max  3: (blank)
     //  4: "Memory Usage (%):"  5: Min  6: Max  7: (blank)
     //  8: "Sort:"              9: Direction     10: (blank)
-    // 11: "Fit Filter:"       12: Fit
+    // 11: "Fit Filter:"       12: Fit           13: (blank)
+    // 14: "Availability:"     15: Show
     let field_row: u16 = match app.filter_field {
         FilterPopupField::ParamsMin => 1,
         FilterPopupField::ParamsMax => 2,
@@ -4601,6 +4872,7 @@ fn draw_filter_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
         FilterPopupField::MemPctMax => 6,
         FilterPopupField::SortDirection => 9,
         FilterPopupField::FitFilter => 12,
+        FilterPopupField::Availability => 15,
     };
 
     // "    Min: " / "    Max: " = 9 chars label

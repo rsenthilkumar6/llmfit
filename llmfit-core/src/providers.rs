@@ -3,7 +3,7 @@
 //! Each provider can list locally installed models and pull new ones.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Provider trait
@@ -396,36 +396,147 @@ impl ModelProvider for OllamaProvider {
 }
 
 // ---------------------------------------------------------------------------
+// OpenAI-compatible provider helpers
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct OpenAiModelList {
+    data: Vec<OpenAiModel>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAiModel {
+    /// Model id, e.g. "meta-llama/Llama-3.1-8B-Instruct".
+    id: String,
+    /// OpenAI-compatible providers may include an owner string. oMLX uses
+    /// `owned_by: "omlx"`, which lets us disambiguate it from vLLM.
+    owned_by: Option<String>,
+}
+
+fn openai_models_url(base_url: &str) -> String {
+    format!("{}/v1/models", base_url.trim_end_matches('/'))
+}
+
+fn fetch_openai_model_list(
+    base_url: &str,
+    timeout: std::time::Duration,
+) -> Option<OpenAiModelList> {
+    let resp = ureq::get(&openai_models_url(base_url))
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+        .ok()?;
+    resp.into_body().read_json::<OpenAiModelList>().ok()
+}
+
+fn openai_model_list_is_omlx(list: &OpenAiModelList) -> bool {
+    list.data.iter().any(|model| {
+        model
+            .owned_by
+            .as_deref()
+            .is_some_and(|owner| owner.eq_ignore_ascii_case("omlx"))
+    })
+}
+
+fn openai_model_ids(list: &OpenAiModelList) -> impl Iterator<Item = &str> {
+    list.data.iter().map(|model| model.id.as_str())
+}
+
+fn is_omlx_status_payload(json: &serde_json::Value) -> bool {
+    json.get("status").and_then(|v| v.as_str()) == Some("ok")
+        && json.get("version").and_then(|v| v.as_str()).is_some()
+        && (json.get("models_discovered").is_some()
+            || json.get("model_memory_max").is_some()
+            || json.get("cache_efficiency").is_some())
+}
+
+fn endpoint_has_omlx_status(base_url: &str, timeout: std::time::Duration) -> bool {
+    let url = format!("{}/api/status", base_url.trim_end_matches('/'));
+    let Ok(resp) = ureq::get(&url)
+        .config()
+        .timeout_global(Some(timeout))
+        .build()
+        .call()
+    else {
+        return false;
+    };
+    let Ok(json) = resp.into_body().read_json::<serde_json::Value>() else {
+        return false;
+    };
+    is_omlx_status_payload(&json)
+}
+
+// ---------------------------------------------------------------------------
 // MLX provider (Apple MLX framework via HuggingFace cache)
 // ---------------------------------------------------------------------------
 
+const MLX_DEFAULT_SERVER_URL: &str = "http://localhost:8080";
+const OMLX_DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8000";
+
+struct MlxServerCandidate<'a> {
+    base_url: &'a str,
+    require_omlx_identity: bool,
+}
+
 pub struct MlxProvider {
     server_url: String,
+    server_url_explicit: bool,
 }
 
 impl Default for MlxProvider {
     fn default() -> Self {
-        let server_url = std::env::var("MLX_LM_HOST")
-            .ok()
-            .and_then(|url| {
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    Some(url)
-                } else {
-                    eprintln!(
-                        "Warning: MLX_LM_HOST must start with http:// or https://, ignoring: {}",
-                        url
-                    );
-                    None
-                }
-            })
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
-        Self { server_url }
+        let explicit = std::env::var("MLX_LM_HOST").ok().and_then(|url| {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                Some(url)
+            } else {
+                eprintln!(
+                    "Warning: MLX_LM_HOST must start with http:// or https://, ignoring: {}",
+                    url
+                );
+                None
+            }
+        });
+        let server_url_explicit = explicit.is_some();
+        let server_url = explicit.unwrap_or_else(|| MLX_DEFAULT_SERVER_URL.to_string());
+        Self {
+            server_url,
+            server_url_explicit,
+        }
     }
 }
 
 impl MlxProvider {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn server_candidates(&self) -> Vec<MlxServerCandidate<'_>> {
+        let mut candidates = vec![MlxServerCandidate {
+            base_url: self.server_url.as_str(),
+            require_omlx_identity: false,
+        }];
+        if !self.server_url_explicit && self.server_url != OMLX_DEFAULT_SERVER_URL {
+            candidates.push(MlxServerCandidate {
+                base_url: OMLX_DEFAULT_SERVER_URL,
+                require_omlx_identity: true,
+            });
+        }
+        candidates
+    }
+
+    fn fetch_candidate_models(
+        candidate: &MlxServerCandidate<'_>,
+        timeout: std::time::Duration,
+    ) -> Option<OpenAiModelList> {
+        let has_omlx_status = candidate.require_omlx_identity
+            && endpoint_has_omlx_status(candidate.base_url, timeout);
+        let list = fetch_openai_model_list(candidate.base_url, timeout)?;
+        if candidate.require_omlx_identity && !has_omlx_status && !openai_model_list_is_omlx(&list)
+        {
+            return None;
+        }
+        Some(list)
     }
 
     /// Single-pass startup probe for MLX.
@@ -436,23 +547,15 @@ impl MlxProvider {
             return (false, set);
         }
 
-        let url = format!("{}/v1/models", self.server_url.trim_end_matches('/'));
-        if let Ok(resp) = ureq::get(&url)
-            .config()
-            .timeout_global(Some(std::time::Duration::from_millis(800)))
-            .build()
-            .call()
-        {
-            if let Ok(json) = resp.into_body().read_json::<serde_json::Value>()
-                && let Some(data) = json.get("data").and_then(|d| d.as_array())
+        for candidate in self.server_candidates() {
+            if let Some(list) =
+                Self::fetch_candidate_models(&candidate, std::time::Duration::from_millis(800))
             {
-                for model in data {
-                    if let Some(id) = model.get("id").and_then(|i| i.as_str()) {
-                        set.insert(id.to_lowercase());
-                    }
+                for id in openai_model_ids(&list) {
+                    set.insert(id.to_lowercase());
                 }
+                return (true, set);
             }
-            return (true, set);
         }
 
         (check_mlx_python(), set)
@@ -603,16 +706,12 @@ impl ModelProvider for MlxProvider {
         if !cfg!(target_os = "macos") {
             return false;
         }
-        // Try the MLX server first
-        let url = format!("{}/v1/models", self.server_url.trim_end_matches('/'));
-        if ureq::get(&url)
-            .config()
-            .timeout_global(Some(std::time::Duration::from_secs(2)))
-            .build()
-            .call()
-            .is_ok()
-        {
-            return true;
+        // Try MLX-compatible servers first.
+        for candidate in self.server_candidates() {
+            if Self::fetch_candidate_models(&candidate, std::time::Duration::from_secs(2)).is_some()
+            {
+                return true;
+            }
         }
         // Fall back to checking if mlx_lm is installed
         check_mlx_python()
@@ -623,20 +722,15 @@ impl ModelProvider for MlxProvider {
         if !cfg!(target_os = "macos") {
             return set;
         }
-        // Also try querying the MLX server if running
-        let url = format!("{}/v1/models", self.server_url.trim_end_matches('/'));
-        if let Ok(resp) = ureq::get(&url)
-            .config()
-            .timeout_global(Some(std::time::Duration::from_secs(2)))
-            .build()
-            .call()
-            && let Ok(json) = resp.into_body().read_json::<serde_json::Value>()
-            && let Some(data) = json.get("data").and_then(|d| d.as_array())
-        {
-            for model in data {
-                if let Some(id) = model.get("id").and_then(|i| i.as_str()) {
+        // Also try querying MLX-compatible servers if running.
+        for candidate in self.server_candidates() {
+            if let Some(list) =
+                Self::fetch_candidate_models(&candidate, std::time::Duration::from_secs(2))
+            {
+                for id in openai_model_ids(&list) {
                     set.insert(id.to_lowercase());
                 }
+                break;
             }
         }
         set
@@ -1535,6 +1629,49 @@ fn is_docker_desktop_running() -> bool {
         .unwrap_or(false)
 }
 
+/// Check whether the Docker Desktop application is installed, regardless of
+/// whether it is currently running (#731). The Model Runner API probe only
+/// succeeds while Docker Desktop is up, so this is what lets the UI say
+/// "installed (not running)" instead of "not detected".
+pub fn docker_desktop_installed() -> bool {
+    docker_desktop_install_candidates(
+        std::env::var("ProgramFiles").ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+    .iter()
+    .any(|p| p.exists())
+}
+
+/// Filesystem locations that identify a Docker Desktop (or docker-model
+/// plugin) install. Pure so tests can cover the per-OS layouts; `exists()`
+/// checks happen in [`docker_desktop_installed`].
+fn docker_desktop_install_candidates(
+    program_files: Option<&str>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(pf) = program_files {
+        let docker = Path::new(pf).join("Docker").join("Docker");
+        // Classic layout, and the frontend/ layout used by newer releases
+        // (e.g. C:\Program Files\Docker\Docker\frontend\Docker Desktop.exe).
+        candidates.push(docker.join("Docker Desktop.exe"));
+        candidates.push(docker.join("frontend").join("Docker Desktop.exe"));
+        candidates.push(Path::new(pf).join("Docker").join("cli-plugins"));
+    }
+    candidates.push(PathBuf::from("/Applications/Docker.app"));
+    candidates.push(PathBuf::from("/opt/docker-desktop"));
+    if let Some(home) = home {
+        candidates.push(home.join("Applications").join("Docker.app"));
+        candidates.push(home.join(".docker").join("desktop"));
+        // Standalone Model Runner plugin (docker-model), installable
+        // without Docker Desktop on Docker CE.
+        let plugins = home.join(".docker").join("cli-plugins");
+        candidates.push(plugins.join("docker-model"));
+        candidates.push(plugins.join("docker-model.exe"));
+    }
+    candidates
+}
+
 fn normalize_docker_mr_host(raw: &str) -> Option<String> {
     let host = raw.trim();
     if host.is_empty() {
@@ -1713,6 +1850,54 @@ impl ModelProvider for DockerModelRunnerProvider {
 pub struct LmStudioProvider {
     base_url: String,
     api_key: Option<String>,
+}
+
+/// Check whether the LM Studio application is installed, regardless of
+/// whether its local server is running (#731). LM Studio's REST API is off
+/// until the user starts the server (or `lms server start`), so the HTTP
+/// probe alone reports installed-but-idle copies as missing.
+pub fn lmstudio_app_installed() -> bool {
+    if command_exists("lms") {
+        return true;
+    }
+    lmstudio_install_candidates(
+        std::env::var("ProgramFiles").ok().as_deref(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+    .iter()
+    .any(|p| p.exists())
+}
+
+/// Filesystem locations that identify an LM Studio install. Pure so tests
+/// can cover the per-OS layouts; `exists()` checks happen in
+/// [`lmstudio_app_installed`].
+fn lmstudio_install_candidates(
+    program_files: Option<&str>,
+    local_app_data: Option<&str>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    // Windows per-machine install (e.g. C:\Program Files\LM Studio\LM Studio.exe).
+    if let Some(pf) = program_files {
+        candidates.push(Path::new(pf).join("LM Studio").join("LM Studio.exe"));
+    }
+    // Windows per-user install (the installer default).
+    if let Some(lad) = local_app_data {
+        candidates.push(
+            Path::new(lad)
+                .join("Programs")
+                .join("LM Studio")
+                .join("LM Studio.exe"),
+        );
+    }
+    candidates.push(PathBuf::from("/Applications/LM Studio.app"));
+    if let Some(home) = home {
+        candidates.push(home.join("Applications").join("LM Studio.app"));
+        // ~/.lmstudio is created on first run on every OS (models, lms CLI).
+        candidates.push(home.join(".lmstudio"));
+    }
+    candidates
 }
 
 fn normalize_lmstudio_host(raw: &str) -> Option<String> {
@@ -2276,7 +2461,7 @@ impl VllmProvider {
     }
 
     fn models_url(&self) -> String {
-        format!("{}/v1/models", self.base_url.trim_end_matches('/'))
+        openai_models_url(&self.base_url)
     }
 
     /// Single-pass startup probe.
@@ -2292,9 +2477,18 @@ impl VllmProvider {
             return (false, set, 0);
         };
 
-        let Ok(list) = resp.into_body().read_json::<VllmModelList>() else {
+        let Ok(list) = resp.into_body().read_json::<OpenAiModelList>() else {
+            if endpoint_has_omlx_status(&self.base_url, std::time::Duration::from_millis(800)) {
+                return (false, set, 0);
+            }
             return (true, set, 0);
         };
+        if openai_model_list_is_omlx(&list)
+            || (list.data.is_empty()
+                && endpoint_has_omlx_status(&self.base_url, std::time::Duration::from_millis(800)))
+        {
+            return (false, set, 0);
+        }
         let models = list.data;
         let count = models.len();
         for m in models {
@@ -2317,29 +2511,31 @@ impl VllmProvider {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct VllmModelList {
-    data: Vec<VllmModel>,
-}
-
-#[derive(serde::Deserialize)]
-struct VllmModel {
-    /// Model id, e.g. "meta-llama/Llama-3.1-8B-Instruct"
-    id: String,
-}
-
 impl ModelProvider for VllmProvider {
     fn name(&self) -> &str {
         "vLLM"
     }
 
     fn is_available(&self) -> bool {
-        ureq::get(&self.models_url())
+        let Ok(resp) = ureq::get(&self.models_url())
             .config()
             .timeout_global(Some(std::time::Duration::from_secs(2)))
             .build()
             .call()
-            .is_ok()
+        else {
+            return false;
+        };
+        match resp.into_body().read_json::<OpenAiModelList>() {
+            Ok(list) => {
+                !openai_model_list_is_omlx(&list)
+                    && (!list.data.is_empty()
+                        || !endpoint_has_omlx_status(
+                            &self.base_url,
+                            std::time::Duration::from_secs(2),
+                        ))
+            }
+            Err(_) => !endpoint_has_omlx_status(&self.base_url, std::time::Duration::from_secs(2)),
+        }
     }
 
     fn installed_models(&self) -> HashSet<String> {
@@ -2401,6 +2597,195 @@ pub fn has_vllm_mapping(hf_name: &str) -> bool {
 /// Given an HF model name, return the model identifier to use for vLLM.
 /// vLLM accepts HF model names directly.
 pub fn vllm_pull_tag(hf_name: &str) -> Option<String> {
+    if hf_name.is_empty() {
+        return None;
+    }
+    Some(hf_name.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// RamaLama provider
+// ---------------------------------------------------------------------------
+
+/// RamaLama — container-based model runner with an OpenAI-compatible API.
+///
+/// Exposes `GET /v1/models` to list served models at
+/// `http://localhost:8080` by default. Override with `RAMALAMA_HOST`.
+///
+/// Like vLLM, RamaLama has no runtime pull endpoint — models are served
+/// via `ramalama serve <model>`. The `start_pull` implementation returns
+/// an informational error directing users to serve the desired model.
+pub struct RamaLamaProvider {
+    base_url: String,
+}
+
+fn normalize_ramalama_host(raw: &str) -> Option<String> {
+    let host = raw.trim();
+    if host.is_empty() {
+        return None;
+    }
+
+    if host.starts_with("http://") || host.starts_with("https://") {
+        return Some(host.to_string());
+    }
+
+    if host.contains("://") {
+        return None;
+    }
+
+    Some(format!("http://{host}"))
+}
+
+impl Default for RamaLamaProvider {
+    fn default() -> Self {
+        let base_url = std::env::var("RAMALAMA_HOST")
+            .ok()
+            .and_then(|raw| {
+                let normalized = normalize_ramalama_host(&raw);
+                if normalized.is_none() {
+                    eprintln!(
+                        "Warning: could not parse RAMALAMA_HOST='{}'. \
+                         Expected host:port or http(s)://host:port",
+                        raw
+                    );
+                }
+                normalized
+            })
+            .unwrap_or_else(|| "http://localhost:8080".to_string());
+        Self { base_url }
+    }
+}
+
+impl RamaLamaProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn models_url(&self) -> String {
+        format!("{}/v1/models", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Single-pass startup probe.
+    /// Returns `(available, installed_models, count)`.
+    pub fn detect_with_installed(&self) -> (bool, HashSet<String>, usize) {
+        let mut set = HashSet::new();
+        let Ok(resp) = ureq::get(&self.models_url())
+            .config()
+            .timeout_global(Some(std::time::Duration::from_millis(800)))
+            .build()
+            .call()
+        else {
+            return (false, set, 0);
+        };
+
+        let Ok(list) = resp.into_body().read_json::<RamaLamaModelList>() else {
+            return (true, set, 0);
+        };
+        let models = list.data;
+        let count = models.len();
+        for m in models {
+            let lower = m.id.to_lowercase();
+            set.insert(lower.clone());
+            // Also insert the model part after the publisher
+            // e.g. "meta-llama/Llama-3.1-8B-Instruct" → "llama-3.1-8b-instruct"
+            if let Some(name) = lower.split('/').next_back()
+                && name != lower
+            {
+                set.insert(name.to_string());
+            }
+        }
+        (true, set, count)
+    }
+
+    pub fn installed_models_counted(&self) -> (HashSet<String>, usize) {
+        let (_, set, count) = self.detect_with_installed();
+        (set, count)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RamaLamaModelList {
+    data: Vec<RamaLamaModel>,
+}
+
+#[derive(serde::Deserialize)]
+struct RamaLamaModel {
+    /// Model id, e.g. "meta-llama/Llama-3.1-8B-Instruct"
+    id: String,
+}
+
+impl ModelProvider for RamaLamaProvider {
+    fn name(&self) -> &str {
+        "RamaLama"
+    }
+
+    fn is_available(&self) -> bool {
+        ureq::get(&self.models_url())
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(2)))
+            .build()
+            .call()
+            .is_ok()
+    }
+
+    fn installed_models(&self) -> HashSet<String> {
+        let (set, _) = self.installed_models_counted();
+        set
+    }
+
+    fn start_pull(&self, _model_tag: &str) -> Result<PullHandle, String> {
+        Err("RamaLama does not support downloading models at runtime. \
+             Serve the desired model with `ramalama serve <model>`."
+            .to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RamaLama name-matching helpers
+// ---------------------------------------------------------------------------
+
+/// RamaLama serves HuggingFace/OCI model names directly. We match against the
+/// model's full HF name and common naming patterns.
+pub fn hf_name_to_ramalama_candidates(hf_name: &str) -> Vec<String> {
+    let repo = hf_name
+        .split('/')
+        .next_back()
+        .unwrap_or(hf_name)
+        .to_lowercase();
+    let mut candidates = vec![hf_name.to_lowercase()];
+    if repo != hf_name.to_lowercase() {
+        candidates.push(repo.clone());
+    }
+    // Strip common suffixes for matching
+    let stripped = repo
+        .replace("-instruct", "")
+        .replace("-chat", "")
+        .replace("-hf", "")
+        .replace("-it", "");
+    if stripped != repo {
+        candidates.push(stripped);
+    }
+    candidates
+}
+
+/// Check if any RamaLama candidates for an HF model appear in the installed set.
+pub fn is_model_installed_ramalama(hf_name: &str, installed: &HashSet<String>) -> bool {
+    let candidates = hf_name_to_ramalama_candidates(hf_name);
+    candidates.iter().any(|candidate| {
+        installed
+            .iter()
+            .any(|installed_name| installed_name.contains(candidate))
+    })
+}
+
+/// RamaLama can serve any HuggingFace model, so we always return true.
+pub fn has_ramalama_mapping(hf_name: &str) -> bool {
+    !hf_name.is_empty()
+}
+
+/// Given an HF model name, return the model identifier to use for RamaLama.
+/// RamaLama accepts HF model names directly.
+pub fn ramalama_pull_tag(hf_name: &str) -> Option<String> {
     if hf_name.is_empty() {
         return None;
     }
@@ -2501,7 +2886,7 @@ fn docker_mr_installed_matches(installed_name: &str, candidate: &str) -> bool {
 
 /// Strip quantization suffix from a GGUF file stem.
 /// "llama-3.1-8b-instruct-q4_k_m" → "llama-3.1-8b-instruct"
-fn strip_gguf_quant_suffix(stem: &str) -> Option<String> {
+pub fn strip_gguf_quant_suffix(stem: &str) -> Option<String> {
     let quant_patterns = [
         "-q8_0", "-q6_k", "-q6_k_l", "-q5_k_m", "-q5_k_s", "-q4_k_m", "-q4_k_s", "-q4_0",
         "-q3_k_m", "-q3_k_s", "-q2_k", "-iq4_xs", "-iq3_m", "-iq2_m", "-iq1_m", "-f16", "-f32",
@@ -2509,7 +2894,14 @@ fn strip_gguf_quant_suffix(stem: &str) -> Option<String> {
     ];
     for pat in &quant_patterns {
         if let Some(pos) = stem.rfind(pat) {
-            return Some(stem[..pos].to_string());
+            let base = &stem[..pos];
+            // Unsloth "Dynamic" GGUFs embed a `-ud` marker between the model
+            // name and the quant (e.g. `qwen3.6-35b-a3b-ud-q4_k_m`). It is not
+            // part of the canonical model name, so strip it too — otherwise the
+            // stem never reduces to the catalog id and the file reads as neither
+            // installed nor served.
+            let base = base.strip_suffix("-ud").unwrap_or(base);
+            return Some(base.to_string());
         }
     }
     None
@@ -2689,21 +3081,25 @@ pub fn is_model_installed_llamacpp(hf_name: &str, installed: &HashSet<String>) -
         .unwrap_or(hf_name)
         .to_lowercase();
 
-    // Direct match on model name stem
+    // Direct match on model name stem. The installed set already contains
+    // both raw file stems and quant-suffix-stripped bases (see
+    // `installed_models_counted`), so exact lookups cover files like
+    // "qwen2.5-7b-instruct-q4_k_m.gguf" matched against the plain repo name.
     if installed.contains(&repo) {
         return true;
     }
 
-    // Check with common suffixes stripped
+    // Also accept a match with common variant suffixes stripped.
+    //
+    // Deliberately no substring matching here: a single "gemma-3.gguf" on
+    // disk must not mark every gemma-3-* model in the database as installed
+    // (`repo.contains("gemma-3")` is true for all of them).
     let stripped = repo
         .replace("-instruct", "")
         .replace("-chat", "")
         .replace("-hf", "")
         .replace("-it", "");
-
-    installed.iter().any(|name| {
-        name.contains(&repo) || name.contains(&stripped) || repo.contains(name.as_str())
-    })
+    installed.contains(&stripped)
 }
 
 /// Given an HF model name, return the best GGUF repo to pull from.
@@ -3274,9 +3670,104 @@ pub fn ollama_pull_tag(hf_name: &str) -> Option<String> {
     lookup_ollama_tag(hf_name).map(|s| s.to_string())
 }
 
+/// Match a running provider's model tag (an Ollama-style id, or a GGUF file
+/// path/stem as reported by llama-server) against an HF-style model name,
+/// reusing the installed-column heuristics.
+///
+/// Two deliberately separate passes: Ollama-style candidate matching runs
+/// only against the verbatim id, while file paths (".../gemma-3.Q8_0.gguf")
+/// get exact stem matching only — feeding a bare stem into the Ollama
+/// candidate heuristics would match whole families.
+pub fn tag_matches_model(tag: &str, hf_name: &str) -> bool {
+    let lower = tag.to_lowercase();
+
+    let mut tag_set = HashSet::new();
+    tag_set.insert(lower.clone());
+    if is_model_installed(hf_name, &tag_set) {
+        return true;
+    }
+
+    let stem = lower
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&lower)
+        .trim_end_matches(".gguf")
+        .to_string();
+    let mut stem_set = HashSet::new();
+    if let Some(base) = strip_gguf_quant_suffix(&stem) {
+        stem_set.insert(base);
+    }
+    stem_set.insert(stem);
+    is_model_installed_llamacpp(hf_name, &stem_set)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Install layouts from issue #731 (Windows, LM Studio + Docker Desktop
+    // installed but their servers not running) must be recognized. Expected
+    // paths are built with join() so separators stay portable across the
+    // 3-OS CI matrix.
+    #[test]
+    fn test_lmstudio_install_candidates_windows_layouts() {
+        let pf = Path::new(r"C:\Program Files");
+        let lad = Path::new(r"C:\Users\ben\AppData\Local");
+        let home = Path::new(r"C:\Users\ben");
+        let candidates = lmstudio_install_candidates(pf.to_str(), lad.to_str(), Some(home));
+        // Reporter's per-machine install.
+        assert!(candidates.contains(&pf.join("LM Studio").join("LM Studio.exe")));
+        // Installer's per-user default.
+        assert!(candidates.contains(&lad.join("Programs").join("LM Studio").join("LM Studio.exe")));
+        // First-run data dir (any OS).
+        assert!(candidates.contains(&home.join(".lmstudio")));
+    }
+
+    #[test]
+    fn test_lmstudio_install_candidates_unix_layouts() {
+        let home = Path::new("/home/ben");
+        let candidates = lmstudio_install_candidates(None, None, Some(home));
+        assert!(candidates.contains(&PathBuf::from("/Applications/LM Studio.app")));
+        assert!(candidates.contains(&home.join("Applications").join("LM Studio.app")));
+        assert!(candidates.contains(&home.join(".lmstudio")));
+    }
+
+    #[test]
+    fn test_docker_desktop_install_candidates_windows_layouts() {
+        let pf = Path::new(r"C:\Program Files");
+        let home = Path::new(r"C:\Users\ben");
+        let candidates = docker_desktop_install_candidates(pf.to_str(), Some(home));
+        let docker = pf.join("Docker").join("Docker");
+        // Classic exe location.
+        assert!(candidates.contains(&docker.join("Docker Desktop.exe")));
+        // Reporter's frontend\ layout from newer Docker Desktop releases.
+        assert!(candidates.contains(&docker.join("frontend").join("Docker Desktop.exe")));
+        assert!(
+            candidates.contains(
+                &home
+                    .join(".docker")
+                    .join("cli-plugins")
+                    .join("docker-model.exe")
+            )
+        );
+    }
+
+    #[test]
+    fn test_docker_desktop_install_candidates_unix_layouts() {
+        let home = Path::new("/home/ben");
+        let candidates = docker_desktop_install_candidates(None, Some(home));
+        assert!(candidates.contains(&PathBuf::from("/Applications/Docker.app")));
+        assert!(candidates.contains(&PathBuf::from("/opt/docker-desktop")));
+        assert!(candidates.contains(&home.join(".docker").join("desktop")));
+        assert!(
+            candidates.contains(
+                &home
+                    .join(".docker")
+                    .join("cli-plugins")
+                    .join("docker-model")
+            )
+        );
+    }
 
     #[test]
     fn test_hf_name_to_mlx_candidates() {
@@ -4072,10 +4563,80 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_gguf_quant_suffix_unsloth_ud_marker() {
+        // Unsloth "Dynamic" GGUFs carry a `-ud` marker before the quant; it
+        // must be stripped alongside the quant so the stem reduces to the
+        // canonical model name.
+        assert_eq!(
+            strip_gguf_quant_suffix("qwen3.6-35b-a3b-ud-q4_k_m").as_deref(),
+            Some("qwen3.6-35b-a3b")
+        );
+        // Non-Unsloth files are unaffected.
+        assert_eq!(
+            strip_gguf_quant_suffix("qwen2.5-7b-instruct-q4_k_m").as_deref(),
+            Some("qwen2.5-7b-instruct")
+        );
+    }
+
+    #[test]
+    fn test_is_model_installed_llamacpp_unsloth_ud() {
+        // `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` on disk yields these set entries
+        // (see `installed_models_counted`) and must mark the catalog model as
+        // installed despite the embedded `-ud` marker.
+        let installed: HashSet<String> = ["qwen3.6-35b-a3b-ud-q4_k_m", "qwen3.6-35b-a3b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(is_model_installed_llamacpp(
+            "Qwen/Qwen3.6-35B-A3B",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_tag_matches_model_unsloth_ud_gguf() {
+        // End-to-end: a llama-server serving an Unsloth UD GGUF reports the
+        // file name as the model id; it must match the catalog HF name so the
+        // model is benchmarkable (regression: `-ud` broke the exact stem match).
+        assert!(tag_matches_model(
+            "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "Qwen/Qwen3.6-35B-A3B"
+        ));
+    }
+
+    #[test]
     fn test_is_model_installed_llamacpp_not_installed() {
         let installed = HashSet::new();
         assert!(!is_model_installed_llamacpp(
             "meta-llama/Llama-3.1-8B-Instruct",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_is_model_installed_llamacpp_no_family_false_positives() {
+        // A single "gemma-3.Q8_0.gguf" on disk yields these stems — it must
+        // mark ONLY repos actually named "gemma-3" as installed, not the
+        // whole gemma-3 family (regression: substring matching ticked every
+        // gemma-3-* model in the table).
+        let installed: HashSet<String> = ["gemma-3.q8_0", "gemma-3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(is_model_installed_llamacpp(
+            "tiny-random/gemma-3",
+            &installed
+        ));
+        assert!(!is_model_installed_llamacpp(
+            "google/gemma-3-27b-it",
+            &installed
+        ));
+        assert!(!is_model_installed_llamacpp(
+            "google/gemma-3-4b-it",
+            &installed
+        ));
+        assert!(!is_model_installed_llamacpp(
+            "unsloth/gemma-3-270m-it",
             &installed
         ));
     }
@@ -4416,6 +4977,82 @@ mod tests {
         );
     }
 
+    // ── OpenAI-compatible identity disambiguation ─────────────────────
+
+    #[test]
+    fn test_omlx_status_payload_detected() {
+        let payload = serde_json::json!({
+            "status": "ok",
+            "version": "0.4.4",
+            "models_discovered": 1,
+            "model_memory_max": 12_649_259_752u64,
+            "cache_efficiency": 0.0
+        });
+
+        assert!(is_omlx_status_payload(&payload));
+    }
+
+    #[test]
+    fn test_omlx_status_payload_rejects_generic_status() {
+        let payload = serde_json::json!({
+            "status": "ok",
+            "version": "1.0.0"
+        });
+
+        assert!(!is_omlx_status_payload(&payload));
+    }
+
+    #[test]
+    fn test_openai_model_list_detects_omlx_owner() {
+        let list: OpenAiModelList = serde_json::from_value(serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "Qwen2.5-0.5B-Instruct-4bit",
+                    "object": "model",
+                    "owned_by": "omlx",
+                    "max_model_len": 32768
+                }
+            ]
+        }))
+        .expect("test payload should parse");
+
+        assert!(openai_model_list_is_omlx(&list));
+    }
+
+    #[test]
+    fn test_openai_model_list_keeps_regular_vllm_available() {
+        let list: OpenAiModelList = serde_json::from_value(serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "meta-llama/Llama-3.1-8B-Instruct",
+                    "object": "model",
+                    "owned_by": "vllm"
+                }
+            ]
+        }))
+        .expect("test payload should parse");
+
+        assert!(!openai_model_list_is_omlx(&list));
+    }
+
+    #[test]
+    fn test_openai_model_list_without_owner_is_not_omlx() {
+        let list: OpenAiModelList = serde_json::from_value(serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "meta-llama/Llama-3.1-8B-Instruct",
+                    "object": "model"
+                }
+            ]
+        }))
+        .expect("test payload should parse");
+
+        assert!(!openai_model_list_is_omlx(&list));
+    }
+
     // ── vLLM ──────────────────────────────────────────────────────────
 
     #[test]
@@ -4485,6 +5122,75 @@ mod tests {
     fn test_normalize_vllm_host_empty() {
         assert_eq!(normalize_vllm_host(""), None);
         assert_eq!(normalize_vllm_host("  "), None);
+    }
+
+    #[test]
+    fn test_hf_name_to_ramalama_candidates() {
+        let candidates = hf_name_to_ramalama_candidates("meta-llama/Llama-3.1-8B-Instruct");
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c == "meta-llama/llama-3.1-8b-instruct")
+        );
+        assert!(candidates.iter().any(|c| c == "llama-3.1-8b-instruct"));
+        // stripped variant (without -instruct)
+        assert!(candidates.iter().any(|c| c == "llama-3.1-8b"));
+    }
+
+    #[test]
+    fn test_is_model_installed_ramalama() {
+        let mut installed = HashSet::new();
+        installed.insert("meta-llama/llama-3.1-8b-instruct".to_string());
+        assert!(is_model_installed_ramalama(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            &installed
+        ));
+        assert!(!is_model_installed_ramalama(
+            "meta-llama/Llama-3.1-70B-Instruct",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_has_ramalama_mapping() {
+        assert!(has_ramalama_mapping("meta-llama/Llama-3.1-8B-Instruct"));
+        assert!(!has_ramalama_mapping(""));
+    }
+
+    #[test]
+    fn test_ramalama_pull_tag() {
+        assert_eq!(
+            ramalama_pull_tag("meta-llama/Llama-3.1-8B-Instruct"),
+            Some("meta-llama/Llama-3.1-8B-Instruct".to_string())
+        );
+        assert_eq!(ramalama_pull_tag(""), None);
+    }
+
+    #[test]
+    fn test_normalize_ramalama_host_with_scheme() {
+        assert_eq!(
+            normalize_ramalama_host("http://myhost:8080"),
+            Some("http://myhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_ramalama_host_without_scheme() {
+        assert_eq!(
+            normalize_ramalama_host("myhost:8080"),
+            Some("http://myhost:8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_ramalama_host_rejects_unsupported_scheme() {
+        assert_eq!(normalize_ramalama_host("ftp://myhost:8080"), None);
+    }
+
+    #[test]
+    fn test_normalize_ramalama_host_empty() {
+        assert_eq!(normalize_ramalama_host(""), None);
+        assert_eq!(normalize_ramalama_host("  "), None);
     }
 
     #[test]

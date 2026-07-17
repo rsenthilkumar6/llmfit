@@ -216,6 +216,20 @@ pub fn collect_diagnostics(version: &str) -> String {
     );
     section(&mut report, "npu-smi info", &capture("npu-smi", &["info"]));
 
+    // Provider applications that are detected by install location rather
+    // than a live API probe (#731) — lets "installed but not running"
+    // reports carry the evidence.
+    section(
+        &mut report,
+        "Provider app installs",
+        &format!(
+            "LM Studio installed: {}\nDocker Desktop installed: {}\nollama on PATH: {}",
+            crate::providers::lmstudio_app_installed(),
+            crate::providers::docker_desktop_installed(),
+            crate::providers::command_exists("ollama"),
+        ),
+    );
+
     report
 }
 

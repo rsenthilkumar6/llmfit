@@ -4,7 +4,8 @@ use llmfit_core::models::{Capability, ModelDatabase, UseCase};
 use llmfit_core::plan::{PlanEstimate, PlanRequest, estimate_model_plan};
 use llmfit_core::providers::{
     self, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
-    ModelProvider, OllamaProvider, PullEvent, PullHandle, VllmProvider, command_exists,
+    ModelProvider, OllamaProvider, PullEvent, PullHandle, RamaLamaProvider, VllmProvider,
+    command_exists,
 };
 use llmfit_core::quality;
 
@@ -86,15 +87,22 @@ pub enum ProviderDetectionMsg {
     },
     DockerMr {
         available: bool,
+        app_installed: bool,
         installed: HashSet<String>,
         installed_count: usize,
     },
     LmStudio {
         available: bool,
+        app_installed: bool,
         installed: HashSet<String>,
         installed_count: usize,
     },
     Vllm {
+        available: bool,
+        installed: HashSet<String>,
+        installed_count: usize,
+    },
+    RamaLama {
         available: bool,
         installed: HashSet<String>,
         installed_count: usize,
@@ -123,6 +131,7 @@ pub enum InputMode {
     DownloadManager,
     FilterPopup,
     Benchmarks,
+    BenchOffer,
 }
 
 /// Fields in the Filter Popup modal.
@@ -134,6 +143,7 @@ pub enum FilterPopupField {
     MemPctMax,
     SortDirection,
     FitFilter,
+    Availability,
 }
 
 impl FilterPopupField {
@@ -144,18 +154,20 @@ impl FilterPopupField {
             Self::MemPctMin => Self::MemPctMax,
             Self::MemPctMax => Self::SortDirection,
             Self::SortDirection => Self::FitFilter,
-            Self::FitFilter => Self::ParamsMin,
+            Self::FitFilter => Self::Availability,
+            Self::Availability => Self::ParamsMin,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::ParamsMin => Self::FitFilter,
+            Self::ParamsMin => Self::Availability,
             Self::ParamsMax => Self::ParamsMin,
             Self::MemPctMin => Self::ParamsMax,
             Self::MemPctMax => Self::MemPctMin,
             Self::SortDirection => Self::MemPctMax,
             Self::FitFilter => Self::SortDirection,
+            Self::Availability => Self::FitFilter,
         }
     }
 }
@@ -169,6 +181,7 @@ struct FilterSnapshot {
     mem_pct_max: String,
     sort_ascending: bool,
     fit_filter: FitFilter,
+    availability_filter: AvailabilityFilter,
 }
 
 /// Fields in the Advanced Configuration modal.
@@ -181,6 +194,7 @@ pub enum AdvConfigField {
     FactorTp,         // Run mode factor: Tensor parallel
     FactorCpuOnly,    // Run mode factor: CPU only
     ContextCap,       // Context window cap
+    DdrBandwidth,     // System RAM bandwidth (GB/s) for MoE offload
 }
 
 impl AdvConfigField {
@@ -192,13 +206,15 @@ impl AdvConfigField {
             AdvConfigField::FactorMoe => AdvConfigField::FactorTp,
             AdvConfigField::FactorTp => AdvConfigField::FactorCpuOnly,
             AdvConfigField::FactorCpuOnly => AdvConfigField::ContextCap,
-            AdvConfigField::ContextCap => AdvConfigField::Efficiency,
+            AdvConfigField::ContextCap => AdvConfigField::DdrBandwidth,
+            AdvConfigField::DdrBandwidth => AdvConfigField::Efficiency,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            AdvConfigField::Efficiency => AdvConfigField::ContextCap,
+            AdvConfigField::Efficiency => AdvConfigField::DdrBandwidth,
+            AdvConfigField::DdrBandwidth => AdvConfigField::ContextCap,
             AdvConfigField::FactorGpu => AdvConfigField::Efficiency,
             AdvConfigField::FactorCpuOffload => AdvConfigField::FactorGpu,
             AdvConfigField::FactorMoe => AdvConfigField::FactorCpuOffload,
@@ -313,6 +329,285 @@ pub enum BenchMsg {
     },
     ModelDone(quality::ModelQualityResult),
     AllDone,
+}
+
+/// Messages sent from the bench-offer worker thread (benchmark of the
+/// selected model, plus the optional share-as-PR flow) to the UI.
+pub enum BenchOfferMsg {
+    Progress(String),
+    /// GitHub device-flow authorization needed: show code + URL in the modal.
+    AuthCode {
+        user_code: String,
+        verification_uri: String,
+    },
+    Done {
+        summary: String,
+        pr_url: Option<String>,
+        /// Set when the bench succeeded but the share step failed/was skipped.
+        share_note: Option<String>,
+    },
+    Error(String),
+}
+
+/// UI state of the bench-offer modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchOfferState {
+    /// Waiting for the user to confirm, toggle share, or dismiss.
+    Offer,
+    /// Worker thread is benchmarking (and possibly sharing).
+    Running,
+    /// Finished — summary (and PR URL, if shared) is displayed.
+    Done,
+    /// Failed — error message is displayed.
+    Error,
+}
+
+/// Match a running provider's model tag against an HF-style model name,
+/// reusing the same heuristics as the installed-column detection.
+///
+/// Two deliberately separate passes: Ollama-style candidate matching runs
+/// only against the verbatim id, while file paths reported by llama-server
+/// (".../gemma-3.Q8_0.gguf") get exact stem matching only — feeding a bare
+/// stem into the Ollama candidate heuristics would match whole families.
+fn bench_target_matches(target_model: &str, hf_name: &str) -> bool {
+    llmfit_core::providers::tag_matches_model(target_model, hf_name)
+}
+
+/// Body of the bench-offer worker thread: find the selected model on a running
+/// provider, benchmark it, and optionally share the result as a PR. All
+/// user-visible output goes through `tx` — never stdout/stderr (the TUI owns
+/// the terminal).
+fn bench_offer_worker(
+    tx: &mpsc::Sender<BenchOfferMsg>,
+    model_name: &str,
+    share: bool,
+    specs: &SystemSpecs,
+) {
+    use llmfit_core::bench::{self, BenchTarget};
+    use llmfit_core::share;
+
+    let targets = bench::discover_all_targets();
+    let target = targets.into_iter().find(|t| {
+        let model = match t {
+            BenchTarget::Ollama { model, .. }
+            | BenchTarget::VLlm { model, .. }
+            | BenchTarget::Mlx { model, .. }
+            | BenchTarget::LlamaCpp { model, .. } => model,
+        };
+        bench_target_matches(model, model_name)
+    });
+    let Some(target) = target else {
+        let _ = tx.send(BenchOfferMsg::Error(format!(
+            "{} is installed but not served by any running provider",
+            model_name
+        )));
+        return;
+    };
+
+    const RUNS: usize = 3;
+    let (provider, url, tag) = match &target {
+        BenchTarget::Ollama { url, model } => ("ollama", url, model),
+        BenchTarget::VLlm { url, model } => ("vllm", url, model),
+        BenchTarget::Mlx { url, model } => ("mlx", url, model),
+        BenchTarget::LlamaCpp { url, model } => ("llamacpp", url, model),
+    };
+
+    // llama-server reports file paths as model ids — display just the stem.
+    let display_tag = tag
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(tag)
+        .trim_end_matches(".gguf")
+        .to_string();
+
+    // Resolve and verify GitHub credentials BEFORE the benchmark runs, so a
+    // missing or expired token (or the device-flow prompt) surfaces while the
+    // user is still watching — not after minutes of benching. A credential
+    // problem never aborts the bench: it downgrades to save-locally.
+    let mut share_note: Option<String> = None;
+    let share_token: Option<String> = if share {
+        let _ = tx.send(BenchOfferMsg::Progress(
+            "Checking GitHub credentials...".into(),
+        ));
+        match tui_share_auth(tx) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                share_note = Some(format!("Share skipped: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let progress_tx = tx.clone();
+    let tag_for_progress = display_tag.clone();
+    let on_progress = move |i: usize, total: usize| {
+        let msg = if i == 0 {
+            format!("Warming up {}...", tag_for_progress)
+        } else {
+            format!("Benchmarking {} — run {}/{}", tag_for_progress, i, total)
+        };
+        let _ = progress_tx.send(BenchOfferMsg::Progress(msg));
+    };
+
+    let result = match &target {
+        BenchTarget::Ollama { url: u, model } => bench::bench_ollama(u, model, RUNS, &on_progress),
+        BenchTarget::VLlm { url: u, model } => {
+            bench::bench_openai_compat(u, model, "vllm", RUNS, &on_progress)
+        }
+        BenchTarget::Mlx { url: u, model } => {
+            bench::bench_openai_compat(u, model, "mlx", RUNS, &on_progress)
+        }
+        BenchTarget::LlamaCpp { url: u, model } => {
+            bench::bench_openai_compat(u, model, "llamacpp", RUNS, &on_progress)
+        }
+    };
+
+    let result = match result {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(BenchOfferMsg::Error(format!(
+                "benchmark via {} at {} failed: {}",
+                provider, url, e
+            )));
+            return;
+        }
+    };
+
+    let ttft = result
+        .summary
+        .avg_ttft_ms
+        .map(|v| format!("{:.0} ms TTFT, ", v))
+        .unwrap_or_default();
+    let summary = format!(
+        "{}: {:.1} tok/s avg ({:.1}–{:.1}), {}{} runs via {}",
+        display_tag,
+        result.summary.avg_tps,
+        result.summary.min_tps,
+        result.summary.max_tps,
+        ttft,
+        result.summary.num_runs,
+        provider,
+    );
+
+    // Always record the run locally; sharing (now or later) uploads from the
+    // pending store, so declining to share never discards the result.
+    let store_err = share::store_local(std::slice::from_ref(&result), specs).err();
+
+    let Some(token) = share_token else {
+        let mut note = share_note.unwrap_or_default();
+        if !note.is_empty() {
+            note.push(' ');
+        }
+        match store_err {
+            None => {
+                let pending = share::pending_benchmarks().len();
+                note.push_str(&format!(
+                    "Saved locally ({pending} pending) — share any time with \
+                     `llmfit bench --share`."
+                ));
+            }
+            Some(e) => note.push_str(&format!("Warning: could not save result locally: {e}")),
+        }
+        let _ = tx.send(BenchOfferMsg::Done {
+            summary,
+            pr_url: None,
+            share_note: Some(note),
+        });
+        return;
+    };
+
+    // Upload the entire pending store: this run plus anything stored earlier.
+    let stored = share::pending_benchmarks();
+    let _ = tx.send(BenchOfferMsg::Progress(format!(
+        "Opening pull request on GitHub ({} submission(s))...",
+        stored.len()
+    )));
+    match share::submit_stored(&stored, &token) {
+        Ok(outcome) => {
+            share::mark_shared(&stored);
+            let mut notes: Vec<String> = Vec::new();
+            if outcome.reused_existing_pr {
+                notes.push(format!(
+                    "Added {} result(s) to your open benchmark PR.",
+                    outcome.uploaded
+                ));
+            }
+            if outcome.skipped > 0 {
+                notes.push(format!(
+                    "{} previously submitted result(s) skipped.",
+                    outcome.skipped
+                ));
+            }
+            if outcome.pr_url.is_none() {
+                notes.push("All results were already contributed upstream.".to_string());
+            }
+            let _ = tx.send(BenchOfferMsg::Done {
+                summary,
+                pr_url: outcome.pr_url,
+                share_note: (!notes.is_empty()).then(|| notes.join(" ")),
+            });
+        }
+        Err(e) => {
+            let _ = tx.send(BenchOfferMsg::Done {
+                summary,
+                pr_url: None,
+                share_note: Some(format!(
+                    "Share failed: {e}. Results remain stored locally — retry with \
+                     `llmfit bench --share`."
+                )),
+            });
+        }
+    }
+}
+
+/// Resolve a *validated* GitHub token for the TUI share flow: env or cached
+/// token (verified against the API), falling back to the device flow with the
+/// code rendered inside the modal. Runs before the benchmark so credential
+/// problems surface immediately.
+fn tui_share_auth(tx: &mpsc::Sender<BenchOfferMsg>) -> Result<String, String> {
+    use llmfit_core::share;
+
+    if let Some((token, source)) = share::resolve_token_noninteractive_with_source() {
+        match share::validate_token(&token) {
+            Ok(Some(_login)) => return Ok(token),
+            Ok(None) => match source {
+                share::TokenSource::Env => {
+                    return Err("GITHUB_TOKEN/GH_TOKEN is invalid or expired.".into());
+                }
+                // Stale cached login — drop it and fall through to a fresh
+                // device-flow authorization.
+                share::TokenSource::Cache => share::clear_cached_token(),
+            },
+            Err(e) => return Err(format!("could not reach GitHub: {e}.")),
+        }
+    }
+
+    let Some(client_id) = share::oauth_client_id() else {
+        return Err("no GitHub token. Set GITHUB_TOKEN or GH_TOKEN.".into());
+    };
+    let auth = share::device_flow_start(&client_id)?;
+    let _ = tx.send(BenchOfferMsg::AuthCode {
+        user_code: auth.user_code.clone(),
+        verification_uri: auth.verification_uri.clone(),
+    });
+    let mut interval = auth.interval;
+    loop {
+        thread::sleep(std::time::Duration::from_secs(interval + 1));
+        match share::device_flow_poll(&client_id, &auth.device_code) {
+            Ok(share::DevicePoll::Token(t)) => {
+                let _ = share::cache_token(&t);
+                return Ok(t);
+            }
+            Ok(share::DevicePoll::Pending) => continue,
+            Ok(share::DevicePoll::SlowDown) => {
+                interval += 5;
+                continue;
+            }
+            Ok(share::DevicePoll::Failed(e)) | Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Per-model bench status for the live dashboard rows.
@@ -612,11 +907,15 @@ pub struct App {
     pub llamacpp_detection_hint: String,
     llamacpp: LlamaCppProvider,
     pub docker_mr_available: bool,
+    pub docker_desktop_installed: bool,
     docker_mr: DockerModelRunnerProvider,
     pub lmstudio_available: bool,
+    pub lmstudio_app_installed: bool,
     lmstudio: LmStudioProvider,
     pub vllm_available: bool,
     vllm: VllmProvider,
+    pub ramalama_available: bool,
+    ramalama: RamaLamaProvider,
 
     // Download state
     pub pull_active: Option<PullHandle>,
@@ -703,6 +1002,7 @@ pub struct App {
     pub adv_config_eff_factor_tp: String,
     pub adv_config_eff_factor_cpu_only: String,
     pub adv_config_context_cap_input: String,
+    pub adv_config_ddr_bandwidth_input: String,
 
     // Filter Popup
     pub filter_field: FilterPopupField,
@@ -753,6 +1053,28 @@ pub struct App {
     pub bench_tests_total: usize,
     bench_rx: Option<mpsc::Receiver<BenchMsg>>,
 
+    // Bench-offer modal (benchmark the selected model, optionally share as PR)
+    pub bench_offer_state: BenchOfferState,
+    pub bench_offer_share: bool,
+    /// Locally stored submissions that a share would also upload.
+    pub bench_offer_pending: usize,
+    /// Why sharing cannot work right now (no token and no OAuth client id);
+    /// `None` when sharing is possible. Checked when the modal opens so the
+    /// user learns about missing credentials before benchmarking.
+    pub bench_offer_share_unavailable: Option<String>,
+    /// HF-style name of the model being offered for benchmark.
+    pub bench_offer_model: String,
+    /// Providers that have the model installed (display names).
+    pub bench_offer_providers: Vec<&'static str>,
+    pub bench_offer_progress: String,
+    /// Device-flow authorization prompt: (user_code, verification_uri).
+    pub bench_offer_auth: Option<(String, String)>,
+    pub bench_offer_summary: Option<String>,
+    pub bench_offer_pr_url: Option<String>,
+    pub bench_offer_share_note: Option<String>,
+    pub bench_offer_error: Option<String>,
+    bench_offer_rx: Option<mpsc::Receiver<BenchOfferMsg>>,
+
     // Background provider detection
     provider_detection_rx: mpsc::Receiver<ProviderDetectionMsg>,
     /// True while background provider detection is still in progress.
@@ -784,10 +1106,14 @@ impl App {
         let mlx_available = false;
         let docker_mr = DockerModelRunnerProvider::new();
         let docker_mr_available = false;
+        let docker_desktop_installed = false;
         let lmstudio = LmStudioProvider::new();
         let lmstudio_available = false;
+        let lmstudio_app_installed = false;
         let vllm = VllmProvider::new();
         let vllm_available = false;
+        let ramalama = RamaLamaProvider::new();
+        let ramalama_available = false;
         let mut installed = llmfit_core::analysis::InstalledIndex::empty();
         installed.llamacpp = llamacpp_installed;
         installed.llamacpp_count = llamacpp_installed_count;
@@ -825,8 +1151,12 @@ impl App {
             thread::spawn(move || {
                 let docker_mr = DockerModelRunnerProvider::new();
                 let (available, installed, installed_count) = docker_mr.detect_with_installed();
+                // Distinguish "not installed" from "installed but Docker
+                // Desktop isn't running" (#731).
+                let app_installed = available || llmfit_core::providers::docker_desktop_installed();
                 let _ = tx.send(ProviderDetectionMsg::DockerMr {
                     available,
+                    app_installed,
                     installed,
                     installed_count,
                 });
@@ -837,7 +1167,23 @@ impl App {
             thread::spawn(move || {
                 let lmstudio = LmStudioProvider::new();
                 let (available, installed, installed_count) = lmstudio.detect_with_installed();
+                // Distinguish "not installed" from "installed but the local
+                // server isn't running" (#731).
+                let app_installed = available || llmfit_core::providers::lmstudio_app_installed();
                 let _ = tx.send(ProviderDetectionMsg::LmStudio {
+                    available,
+                    app_installed,
+                    installed,
+                    installed_count,
+                });
+            });
+        }
+        {
+            let tx = provider_tx.clone();
+            thread::spawn(move || {
+                let vllm = VllmProvider::new();
+                let (available, installed, installed_count) = vllm.detect_with_installed();
+                let _ = tx.send(ProviderDetectionMsg::Vllm {
                     available,
                     installed,
                     installed_count,
@@ -847,9 +1193,9 @@ impl App {
         {
             let tx = provider_tx;
             thread::spawn(move || {
-                let vllm = VllmProvider::new();
-                let (available, installed, installed_count) = vllm.detect_with_installed();
-                let _ = tx.send(ProviderDetectionMsg::Vllm {
+                let ramalama = RamaLamaProvider::new();
+                let (available, installed, installed_count) = ramalama.detect_with_installed();
+                let _ = tx.send(ProviderDetectionMsg::RamaLama {
                     available,
                     installed,
                     installed_count,
@@ -865,6 +1211,11 @@ impl App {
             .count();
 
         // Only analyze models that can actually run on this hardware.
+        // Measured sources, most trustworthy first: your own runs, llmfit
+        // community submissions on identical hardware, localmaxxing presets.
+        let local_index = llmfit_core::share::LocalBenchIndex::load(&specs);
+        let community_index = llmfit_core::benchmarks::CommunityBenchIndex::for_specs(&specs);
+        let measured_index = llmfit_core::benchmarks::MeasuredTpsIndex::for_specs(&specs);
         let mut all_fits: Vec<ModelFit> = db
             .get_all_models()
             .iter()
@@ -872,9 +1223,21 @@ impl App {
             .map(|m| {
                 let mut fit = ModelFit::analyze_with_context_limit(m, &specs, context_limit);
                 fit.installed = installed.is_installed(&m.name);
+                fit.measured_tps = local_index
+                    .as_ref()
+                    .and_then(|idx| idx.lookup(&m.name))
+                    .or_else(|| community_index.as_ref().and_then(|idx| idx.lookup(&m.name)))
+                    .or_else(|| {
+                        measured_index
+                            .as_ref()
+                            .and_then(|idx| idx.lookup(&m.name, &fit.best_quant))
+                    });
                 fit
             })
             .collect();
+
+        // Calibrate formula estimates from the user's own benchmark runs.
+        llmfit_core::analysis::apply_local_calibration(&mut all_fits);
 
         // Sort by fit level then RAM usage
         all_fits = llmfit_core::fit::rank_models_by_fit(all_fits);
@@ -1089,11 +1452,15 @@ impl App {
             llamacpp_detection_hint,
             llamacpp,
             docker_mr_available,
+            docker_desktop_installed,
             docker_mr,
             lmstudio_available,
+            lmstudio_app_installed,
             lmstudio,
             vllm_available,
             vllm,
+            ramalama_available,
+            ramalama,
             pull_active: None,
             pull_status: None,
             pull_percent: None,
@@ -1154,6 +1521,7 @@ impl App {
             adv_config_eff_factor_tp: "0.9".to_string(),
             adv_config_eff_factor_cpu_only: "0.3".to_string(),
             adv_config_context_cap_input: String::new(), // empty = use default
+            adv_config_ddr_bandwidth_input: String::new(), // empty = auto-detect
             // Filter popup defaults
             filter_field: FilterPopupField::ParamsMin,
             filter_cursor_position: 0,
@@ -1191,6 +1559,20 @@ impl App {
             bench_tests_done: 0,
             bench_tests_total: 0,
             bench_rx: None,
+            // Bench-offer modal
+            bench_offer_state: BenchOfferState::Offer,
+            bench_offer_share: false,
+            bench_offer_pending: 0,
+            bench_offer_share_unavailable: None,
+            bench_offer_model: String::new(),
+            bench_offer_providers: Vec::new(),
+            bench_offer_progress: String::new(),
+            bench_offer_auth: None,
+            bench_offer_summary: None,
+            bench_offer_pr_url: None,
+            bench_offer_share_note: None,
+            bench_offer_error: None,
+            bench_offer_rx: None,
             provider_detection_rx,
             providers_loading: true,
         };
@@ -2022,15 +2404,273 @@ impl App {
         self.bench_cursor = 0;
         self.bench_scroll = 0;
 
-        // Fetch if we don't have data yet
-        if self.bench_entries.is_empty() && !self.bench_loading {
+        // If the selected model is installed and a provider has it, offer to
+        // benchmark it (with optional share-as-PR) before showing the board.
+        if self.bench_offer_rx.is_none()
+            && let Some(fit) = self.selected_fit()
+            && fit.installed
+        {
+            let name = fit.model.name.clone();
+            let providers = self.installed.installed_providers(&name);
+            if !providers.is_empty() {
+                self.bench_offer_state = BenchOfferState::Offer;
+                self.bench_offer_model = name;
+                self.bench_offer_providers = providers;
+                self.bench_offer_pending = llmfit_core::share::pending_benchmarks().len();
+                // Cheap offline check (env var + cached-token file) so the
+                // modal can flag missing credentials before a bench starts.
+                self.bench_offer_share_unavailable =
+                    if llmfit_core::share::resolve_token_noninteractive().is_some()
+                        || llmfit_core::share::oauth_client_id().is_some()
+                    {
+                        None
+                    } else {
+                        Some("no GitHub credentials (set GITHUB_TOKEN)".to_string())
+                    };
+                self.bench_offer_progress = String::new();
+                self.bench_offer_auth = None;
+                self.bench_offer_summary = None;
+                self.bench_offer_pr_url = None;
+                self.bench_offer_share_note = None;
+                self.bench_offer_error = None;
+                self.input_mode = InputMode::BenchOffer;
+            }
+        }
+
+        // Fetch if we have no server data yet (pinned local rows don't count)
+        let has_server_rows = self
+            .bench_entries
+            .iter()
+            .any(|e| !e.id.starts_with("local:"));
+        if !has_server_rows && !self.bench_loading {
             self.fetch_benchmarks();
+        } else {
+            // Cached board — still refresh the pinned local rows.
+            self.merge_local_bench_rows();
         }
     }
 
     pub fn close_benchmarks(&mut self) {
         self.show_benchmarks = false;
         self.input_mode = InputMode::Normal;
+    }
+
+    /// Toggle the "share with llmfit" checkbox in the bench-offer modal.
+    /// A no-op when sharing is unavailable (the modal shows why).
+    pub fn bench_offer_toggle_share(&mut self) {
+        if self.bench_offer_share_unavailable.is_some() {
+            self.bench_offer_share = false;
+            return;
+        }
+        self.bench_offer_share = !self.bench_offer_share;
+    }
+
+    /// Dismiss the bench-offer modal and drop into the leaderboard view. A
+    /// still-running worker is detached: its receiver is dropped and its sends
+    /// fail silently.
+    pub fn bench_offer_dismiss(&mut self) {
+        self.bench_offer_rx = None;
+        self.bench_offer_state = BenchOfferState::Offer;
+        self.input_mode = InputMode::Benchmarks;
+    }
+
+    /// Start the bench(+share) worker for the offered model.
+    pub fn bench_offer_confirm(&mut self) {
+        if self.bench_offer_state != BenchOfferState::Offer {
+            return;
+        }
+        let model_name = self.bench_offer_model.clone();
+        let share = self.bench_offer_share;
+        // Share real hardware, never simulated specs.
+        let specs = self.real_specs.clone();
+
+        let (tx, rx) = mpsc::channel::<BenchOfferMsg>();
+        self.bench_offer_rx = Some(rx);
+        self.bench_offer_state = BenchOfferState::Running;
+        self.bench_offer_progress = "Detecting providers...".to_string();
+
+        thread::spawn(move || {
+            bench_offer_worker(&tx, &model_name, share, &specs);
+        });
+    }
+
+    /// Drain bench-offer worker messages (called every frame, non-blocking).
+    pub fn tick_bench_offer(&mut self) {
+        let mut finished = false;
+        if let Some(rx) = &self.bench_offer_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    BenchOfferMsg::Progress(s) => {
+                        // Any progress after the auth prompt means the device
+                        // flow completed — stop showing the code.
+                        self.bench_offer_auth = None;
+                        self.bench_offer_progress = s;
+                    }
+                    BenchOfferMsg::AuthCode {
+                        user_code,
+                        verification_uri,
+                    } => {
+                        self.bench_offer_auth = Some((user_code, verification_uri));
+                    }
+                    BenchOfferMsg::Done {
+                        summary,
+                        pr_url,
+                        share_note,
+                    } => {
+                        self.bench_offer_state = BenchOfferState::Done;
+                        self.bench_offer_summary = Some(summary);
+                        self.bench_offer_pr_url = pr_url;
+                        self.bench_offer_share_note = share_note;
+                        self.bench_offer_auth = None;
+                        finished = true;
+                    }
+                    BenchOfferMsg::Error(e) => {
+                        self.bench_offer_state = BenchOfferState::Error;
+                        self.bench_offer_error = Some(e);
+                        self.bench_offer_auth = None;
+                        finished = true;
+                    }
+                }
+            }
+        }
+        if finished {
+            self.bench_offer_rx = None;
+            // The worker stored (and possibly shared) a new local result —
+            // refresh the local rows pinned to the leaderboard behind the
+            // modal and the measured tok/s shown in the main table.
+            self.merge_local_bench_rows();
+            self.refresh_local_measured_tps();
+        }
+    }
+
+    /// Re-annotate fit rows with the latest local benchmark measurements so
+    /// the main table's tok/s column reflects a just-finished bench without a
+    /// restart. Only upgrades rows a local run matches; community-measured
+    /// values elsewhere are left alone. Estimate calibration is then
+    /// recomputed (idempotently) from the updated anchors.
+    pub fn refresh_local_measured_tps(&mut self) {
+        // Same specs the fits were built with: under simulated hardware the
+        // stored runs won't match, so simulated estimates stay untouched.
+        if let Some(idx) = llmfit_core::share::LocalBenchIndex::load(&self.specs) {
+            for fit in &mut self.all_fits {
+                if let Some(m) = idx.lookup(&fit.model.name) {
+                    fit.measured_tps = Some(m);
+                }
+            }
+        }
+        llmfit_core::analysis::apply_local_calibration(&mut self.all_fits);
+    }
+
+    /// Rebuild the rows pinned at the top of the leaderboard: your stored
+    /// runs (`local:` ids, "you (local)/(shared)") and llmfit community
+    /// submissions recorded on identical hardware (`community:` ids,
+    /// "llmfit community"). Skipped while browsing a hardware preset other
+    /// than this machine.
+    pub fn merge_local_bench_rows(&mut self) {
+        use llmfit_core::benchmarks::{
+            LeaderboardEngine, LeaderboardEntry, LeaderboardModel, LeaderboardUser,
+        };
+
+        self.bench_entries
+            .retain(|e| !e.id.starts_with("local:") && !e.id.starts_with("community:"));
+        if self.bench_hw_label.is_some() {
+            return;
+        }
+
+        fn pinned_row(
+            id: String,
+            who: &str,
+            model: &str,
+            provider: &str,
+            tps: Option<f64>,
+            ttft: Option<f64>,
+        ) -> LeaderboardEntry {
+            LeaderboardEntry {
+                id,
+                tok_s_out: tps,
+                tok_s_total: None,
+                ttft_ms: ttft,
+                context_length: None,
+                batch_size: None,
+                peak_vram_gb: None,
+                notes: None,
+                model: Some(LeaderboardModel {
+                    hf_id: model.to_string(),
+                    display_name: None,
+                    family: None,
+                    params: None,
+                    is_mo_e: None,
+                }),
+                hardware: None,
+                engine: Some(LeaderboardEngine {
+                    engine_name: provider.to_string(),
+                    engine_version: None,
+                    quantization: String::new(),
+                    backend: None,
+                }),
+                engine_flags: None,
+                user: Some(LeaderboardUser {
+                    username: Some(who.to_string()),
+                    verified: None,
+                }),
+            }
+        }
+
+        let mut local: Vec<LeaderboardEntry> = Vec::new();
+        let stores = [
+            ("you (local)", llmfit_core::share::pending_benchmarks()),
+            ("you (shared)", llmfit_core::share::shared_benchmarks()),
+        ];
+        for (who, stored) in &stores {
+            for s in stored {
+                let Some(results) = s.payload["results"].as_array() else {
+                    continue;
+                };
+                for (i, r) in results.iter().enumerate() {
+                    local.push(pinned_row(
+                        format!("local:{}:{i}", s.path.display()),
+                        who,
+                        r["model"].as_str().unwrap_or("?"),
+                        r["provider"].as_str().unwrap_or(""),
+                        r["avgTps"].as_f64(),
+                        r["avgTtftMs"].as_f64(),
+                    ));
+                }
+            }
+        }
+        // Newest first, pinned above the fetched leaderboard.
+        local.reverse();
+
+        // Embedded community submissions on identical hardware — below your
+        // own rows. Your shared runs also live in the embedded data, so skip
+        // community entries that duplicate a local row (same model + tok/s).
+        let is_dup = |model: &str, tps: f64, rows: &[LeaderboardEntry]| {
+            rows.iter()
+                .any(|e| e.hf_id() == model && e.tok_s_out.is_some_and(|t| (t - tps).abs() < 0.005))
+        };
+        let community = llmfit_core::benchmarks::community_results_for_specs(&self.specs);
+        for (i, r) in community.iter().enumerate() {
+            if is_dup(&r.model, r.avg_tps, &local) {
+                continue;
+            }
+            local.push(pinned_row(
+                format!("community:{i}"),
+                "llmfit community",
+                &r.model,
+                &r.provider,
+                Some(r.avg_tps),
+                r.ttft_ms,
+            ));
+        }
+
+        if local.is_empty() {
+            return;
+        }
+        local.append(&mut self.bench_entries);
+        self.bench_entries = local;
+        if self.bench_cursor >= self.bench_entries.len() {
+            self.bench_cursor = self.bench_entries.len().saturating_sub(1);
+        }
     }
 
     pub fn fetch_benchmarks(&mut self) {
@@ -2057,6 +2697,8 @@ impl App {
                 }
             }
         }
+        // Local results render even when the API is unreachable.
+        self.merge_local_bench_rows();
     }
 
     pub fn bench_move_up(&mut self) {
@@ -2159,6 +2801,7 @@ impl App {
                     }
                 }
             }
+            self.merge_local_bench_rows();
         }
 
         self.bench_cursor = 0;
@@ -2919,6 +3562,7 @@ impl App {
             .filter(|m| !backend_compatible(m, &self.specs))
             .count();
 
+        let measured_index = llmfit_core::benchmarks::MeasuredTpsIndex::for_specs(&self.specs);
         self.all_fits = db
             .get_all_models()
             .iter()
@@ -2927,6 +3571,9 @@ impl App {
                 let mut fit =
                     ModelFit::analyze_with_context_limit(m, &self.specs, self.context_limit);
                 fit.installed = self.installed.is_installed(&m.name);
+                fit.measured_tps = measured_index
+                    .as_ref()
+                    .and_then(|idx| idx.lookup(&m.name, &fit.best_quant));
                 fit
             })
             .collect();
@@ -3028,6 +3675,10 @@ impl App {
             Some(cap) => cap.to_string(),
             None => String::new(),
         };
+        self.adv_config_ddr_bandwidth_input = match self.calc_config.ddr_bandwidth_gbps {
+            Some(bw) => format!("{bw:.0}"),
+            None => String::new(),
+        };
         self.adv_config_field = AdvConfigField::Efficiency;
         self.adv_config_cursor_position = self.adv_config_efficiency_input.len();
         self.adv_config_dirty = false;
@@ -3048,6 +3699,7 @@ impl App {
             mem_pct_max: self.filter_mem_pct_max_input.clone(),
             sort_ascending: self.sort_ascending,
             fit_filter: self.fit_filter,
+            availability_filter: self.availability_filter,
         });
         self.filter_field = FilterPopupField::ParamsMin;
         self.filter_cursor_position = self.filter_params_min_input.len();
@@ -3063,6 +3715,7 @@ impl App {
             self.filter_mem_pct_max_input = snap.mem_pct_max;
             self.sort_ascending = snap.sort_ascending;
             self.fit_filter = snap.fit_filter;
+            self.availability_filter = snap.availability_filter;
         }
         self.input_mode = InputMode::Normal;
     }
@@ -3130,7 +3783,9 @@ impl App {
             FilterPopupField::ParamsMax => self.filter_params_max_input.len(),
             FilterPopupField::MemPctMin => self.filter_mem_pct_min_input.len(),
             FilterPopupField::MemPctMax => self.filter_mem_pct_max_input.len(),
-            FilterPopupField::SortDirection | FilterPopupField::FitFilter => 0,
+            FilterPopupField::SortDirection
+            | FilterPopupField::FitFilter
+            | FilterPopupField::Availability => 0,
         }
     }
 
@@ -3140,7 +3795,9 @@ impl App {
             FilterPopupField::ParamsMax => &mut self.filter_params_max_input,
             FilterPopupField::MemPctMin => &mut self.filter_mem_pct_min_input,
             FilterPopupField::MemPctMax => &mut self.filter_mem_pct_max_input,
-            FilterPopupField::SortDirection | FilterPopupField::FitFilter => {
+            FilterPopupField::SortDirection
+            | FilterPopupField::FitFilter
+            | FilterPopupField::Availability => {
                 unreachable!("no text input for toggle fields")
             }
         }
@@ -3172,6 +3829,10 @@ impl App {
         self.fit_filter = self.fit_filter.next();
     }
 
+    pub fn cycle_filter_availability(&mut self) {
+        self.availability_filter = self.availability_filter.next();
+    }
+
     pub fn apply_filter_popup(&mut self) {
         self.filter_snapshot = None;
         self.sort_ascending = self.filter_sort_ascending;
@@ -3190,6 +3851,7 @@ impl App {
             AdvConfigField::FactorTp => &self.adv_config_eff_factor_tp,
             AdvConfigField::FactorCpuOnly => &self.adv_config_eff_factor_cpu_only,
             AdvConfigField::ContextCap => &self.adv_config_context_cap_input,
+            AdvConfigField::DdrBandwidth => &self.adv_config_ddr_bandwidth_input,
         }
     }
 
@@ -3202,6 +3864,7 @@ impl App {
             AdvConfigField::FactorTp => &mut self.adv_config_eff_factor_tp,
             AdvConfigField::FactorCpuOnly => &mut self.adv_config_eff_factor_cpu_only,
             AdvConfigField::ContextCap => &mut self.adv_config_context_cap_input,
+            AdvConfigField::DdrBandwidth => &mut self.adv_config_ddr_bandwidth_input,
         }
     }
 
@@ -3309,6 +3972,15 @@ impl App {
         } else {
             self.adv_config_context_cap_input.parse().ok()
         };
+        // Empty = auto (env var, then measured, then 50 GB/s fallback).
+        let ddr_bandwidth_gbps: Option<f64> = if self.adv_config_ddr_bandwidth_input.is_empty() {
+            None
+        } else {
+            self.adv_config_ddr_bandwidth_input
+                .parse()
+                .ok()
+                .filter(|bw: &f64| *bw > 0.0)
+        };
 
         // Update the config
         self.calc_config = CalcConfig {
@@ -3321,6 +3993,7 @@ impl App {
                 cpu_only,
             },
             context_cap,
+            ddr_bandwidth_gbps,
             ..self.calc_config
         };
 
@@ -3339,6 +4012,7 @@ impl App {
             .filter(|m| !backend_compatible(m, &self.specs))
             .count();
 
+        let measured_index = llmfit_core::benchmarks::MeasuredTpsIndex::for_specs(&self.specs);
         self.all_fits = db
             .get_all_models()
             .iter()
@@ -3347,6 +4021,9 @@ impl App {
                 let mut fit =
                     ModelFit::analyze_with_config(m, &self.specs, self.calc_config.clone());
                 fit.installed = self.installed.is_installed(&m.name);
+                fit.measured_tps = measured_index
+                    .as_ref()
+                    .and_then(|idx| idx.lookup(&m.name, &fit.best_quant));
                 fit
             })
             .collect();
@@ -3761,6 +4438,7 @@ impl App {
         let (docker_mr, docker_mr_count) = self.docker_mr.installed_models_counted();
         let (lmstudio, lmstudio_count) = self.lmstudio.installed_models_counted();
         let (vllm, vllm_count) = self.vllm.installed_models_counted();
+        let (ramalama, ramalama_count) = self.ramalama.installed_models_counted();
         self.installed = llmfit_core::analysis::InstalledIndex {
             ollama,
             ollama_count,
@@ -3773,6 +4451,8 @@ impl App {
             lmstudio_count,
             vllm,
             vllm_count,
+            ramalama,
+            ramalama_count,
         };
         for fit in &mut self.all_fits {
             fit.installed = self.installed.is_installed(&fit.model.name);
@@ -3893,19 +4573,23 @@ impl App {
                         }
                         ProviderDetectionMsg::DockerMr {
                             available,
+                            app_installed,
                             installed,
                             installed_count,
                         } => {
                             self.docker_mr_available = available;
+                            self.docker_desktop_installed = app_installed;
                             self.installed.docker_mr = installed;
                             self.installed.docker_mr_count = installed_count;
                         }
                         ProviderDetectionMsg::LmStudio {
                             available,
+                            app_installed,
                             installed,
                             installed_count,
                         } => {
                             self.lmstudio_available = available;
+                            self.lmstudio_app_installed = app_installed;
                             self.installed.lmstudio = installed;
                             self.installed.lmstudio_count = installed_count;
                         }
@@ -3917,6 +4601,15 @@ impl App {
                             self.vllm_available = available;
                             self.installed.vllm = installed;
                             self.installed.vllm_count = installed_count;
+                        }
+                        ProviderDetectionMsg::RamaLama {
+                            available,
+                            installed,
+                            installed_count,
+                        } => {
+                            self.ramalama_available = available;
+                            self.installed.ramalama = installed;
+                            self.installed.ramalama_count = installed_count;
                         }
                     }
                 }
@@ -4333,6 +5026,7 @@ mod tests {
                 has_gpu: false,
                 gpu_vram_gb: None,
                 total_gpu_vram_gb: None,
+                gpu_available_gb: None,
                 gpu_name: None,
                 gpu_count: 0,
                 unified_memory: false,
@@ -4405,6 +5099,8 @@ mod tests {
             fits_with_turboquant: false,
             effective_context_length: 8192,
             usable_context: 8192,
+            estimate_basis: Default::default(),
+            measured_tps: None,
         }
     }
 
@@ -4633,5 +5329,95 @@ mod tests {
         app.search_input('z');
         assert!(app.filtered_fits.is_empty());
         assert_eq!(app.selected_row, 0);
+    }
+
+    /// Build an app with one installed model, primed so open_benchmarks
+    /// skips the network fetch (bench_loading = true).
+    fn app_with_installed_model(installed: bool) -> App {
+        let mut app = test_app();
+        let mut fit = test_fit("test/llama-3.1-8b", FitLevel::Perfect, 90.0);
+        fit.installed = installed;
+        app.all_fits = vec![fit];
+        app.filtered_fits = vec![0];
+        app.selected_row = 0;
+        if installed {
+            app.installed.ollama.insert("test/llama-3.1-8b".to_string());
+        }
+        app.bench_loading = true; // skip leaderboard fetch in tests
+        app
+    }
+
+    #[test]
+    fn open_benchmarks_offers_bench_for_installed_model() {
+        let mut app = app_with_installed_model(true);
+        app.open_benchmarks();
+        assert_eq!(app.input_mode, InputMode::BenchOffer);
+        assert_eq!(app.bench_offer_state, BenchOfferState::Offer);
+        assert_eq!(app.bench_offer_model, "test/llama-3.1-8b");
+        assert_eq!(app.bench_offer_providers, vec!["Ollama"]);
+        assert!(app.show_benchmarks);
+    }
+
+    #[test]
+    fn open_benchmarks_skips_offer_for_uninstalled_model() {
+        let mut app = app_with_installed_model(false);
+        app.open_benchmarks();
+        assert_eq!(app.input_mode, InputMode::Benchmarks);
+    }
+
+    #[test]
+    fn bench_offer_share_toggle_and_dismiss() {
+        let mut app = app_with_installed_model(true);
+        app.open_benchmarks();
+        // open_benchmarks probes for real GitHub credentials (env token or
+        // cached login), which differ between dev machines and CI runners —
+        // pin the outcome so the toggle path is deterministic.
+        app.bench_offer_share_unavailable = None;
+        assert!(!app.bench_offer_share);
+        app.bench_offer_toggle_share();
+        assert!(app.bench_offer_share);
+        app.bench_offer_toggle_share();
+        assert!(!app.bench_offer_share);
+
+        // Dismiss drops into the leaderboard view, not back to Normal.
+        app.bench_offer_dismiss();
+        assert_eq!(app.input_mode, InputMode::Benchmarks);
+        assert!(app.show_benchmarks);
+    }
+
+    #[test]
+    fn bench_offer_share_toggle_noop_without_credentials() {
+        let mut app = app_with_installed_model(true);
+        app.open_benchmarks();
+        app.bench_offer_share_unavailable = Some("no GitHub credentials".to_string());
+        app.bench_offer_toggle_share();
+        assert!(!app.bench_offer_share);
+    }
+
+    #[test]
+    fn bench_target_matching_reuses_installed_heuristics() {
+        // Exact HF name (as MLX/vLLM report it)
+        assert!(bench_target_matches(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "meta-llama/Llama-3.1-8B-Instruct"
+        ));
+        // Real Ollama tag resolved through the mapping table
+        assert!(bench_target_matches("llama3.1:8b", "test/llama-3.1-8b"));
+        // Variant tag reported by `ollama list` (quant suffix)
+        assert!(bench_target_matches(
+            "llama3.1:8b-instruct-q4_K_M",
+            "test/llama-3.1-8b"
+        ));
+        // llama-server style: model id is a file path with quant suffix
+        assert!(bench_target_matches(
+            "/home/user/.cache/llmfit/models/gemma-3.Q8_0.gguf",
+            "tiny-random/gemma-3"
+        ));
+        // Unrelated models must not match
+        assert!(!bench_target_matches("qwen2.5:7b", "test/llama-3.1-8b"));
+        assert!(!bench_target_matches(
+            "/home/user/.cache/llmfit/models/gemma-3.Q8_0.gguf",
+            "google/gemma-3-27b-it"
+        ));
     }
 }

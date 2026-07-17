@@ -17,7 +17,9 @@
   <a href="https://about.signpath.io"><img src="https://img.shields.io/badge/SignPath-signed-brightgreen?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0id2hpdGUiIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggZD0iTTEwLjA2NyA0LjU2N2wtNC43MzQgNC43MzMtMS40LTEuNGExIDEgMCAwIDAtMS40MTQgMS40MTRsMi4xIDIuMWExIDEgMCAwIDAgMS40MTQgMGw1LjQ0LTUuNDRhMSAxIDAgMCAwLTEuNDE0LTEuNDE0eiIvPjwvc3ZnPg==" alt="Signed with SignPath"></a>
 </p>
 
-> **新功能：[社区排行榜](#社区排行榜-b)** — 浏览真实用户的实际性能数据。按 `b` 键查看任意 GPU（不仅限于你的设备）实测的 tok/s、TTFT 和 VRAM 数据。从 RTX 5090 到 Apple M1 的 27+ 种硬件预设中进行选择，按 `H` 键在购买或组装硬件前比较真实数据。
+> **📊 新功能：基准测试与共享 — 来自你机器的真实数据，让所有人的估算更准确。** `llmfit bench --share` 在你的硬件上实测 tok/s，并以 PR 的形式贡献回项目 — 无需 `gh` CLI，也无需第三方账号。每次测试结果都会先保存在本地（可以暂不共享，之后随时批量上传），你自己的实测值会替换拟合表中的估算值；每条合并的提交都会随下一个版本发布：相同硬件的用户无需自己跑基准测试，就能获得实测 `✓` 数值和校准后的估算。[开始共享 →](docs/cli.md#contributing-benchmarks-bench---share)
+>
+> *此前：[llmfit 1.0 — 让每个数字都可验证的里程碑版本 →](https://github.com/AlexsJones/llmfit/discussions/708)*
 
 **数百种模型与提供商，一条命令即可找出你的硬件能运行哪些模型。**
 

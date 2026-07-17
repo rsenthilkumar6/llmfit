@@ -15,6 +15,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -280,6 +281,7 @@ TARGET_MODELS = [
     # NCAI VAETKI
     "nc-ai-consortium/VAETKI-7B-A1B",
     "nc-ai-consortium/VAETKI-20B-A2B",
+    "NC-AI-consortium-VAETKI/VAETKI",
     "nc-ai-consortium/VAETKI-VL-7B-A1B",
 ]
 
@@ -359,7 +361,13 @@ MOE_ACTIVE_PARAMS = {
     "google/gemma-4-26B-A4B-it": 4_000_000_000,
     "nc-ai-consortium/VAETKI-7B-A1B": 1_200_000_000,
     "nc-ai-consortium/VAETKI-20B-A2B": 2_200_000_000,
+    "NC-AI-consortium-VAETKI/VAETKI": 10_100_000_000,
     "nc-ai-consortium/VAETKI-VL-7B-A1B": 1_200_000_000,
+}
+
+# Model card lists 32k context; config.json exposes max_position_embeddings=131072.
+CONTEXT_LENGTH_OVERRIDES = {
+    "NC-AI-consortium-VAETKI/VAETKI": 32_768,
 }
 
 
@@ -739,6 +747,7 @@ def extract_provider(repo_id: str) -> str:
         "nousresearch": "NousResearch",  # NEW
         "wizardlmteam": "WizardLM",  # NEW
         "liquidai": "Liquid AI",
+        "nc-ai-consortium-vaetki": "NCAI",
         "nc-ai-consortium": "NCAI",
     }
     return mapping.get(org, org)
@@ -923,6 +932,9 @@ def _detect_format_from_name(repo_id: str) -> tuple[str, str]:
 
 def scrape_model(repo_id: str) -> dict | None:
     """Scrape a single model and return an LlmModel-compatible dict."""
+    if is_test_stub(repo_id):
+        print(f"  ⚠ Skipping test stub {repo_id}", file=sys.stderr)
+        return None
     info = fetch_model_info(repo_id)
     if not info:
         return None
@@ -949,7 +961,10 @@ def scrape_model(repo_id: str) -> dict | None:
     model_format, default_quant = detect_quant_format(repo_id, full_config)
     if pipeline_tag == "text-to-speech":
         model_format, default_quant = ("safetensors", "F16")
-    context_length = infer_context_length(full_config) if full_config else infer_context_length(config)
+    context_length = CONTEXT_LENGTH_OVERRIDES.get(
+        repo_id,
+        infer_context_length(full_config) if full_config else infer_context_length(config),
+    )
 
     # Correct parameters_raw when safetensors reports quantized element counts
     # instead of true parameter count (common in FP8/INT4/INT8 repos).
@@ -1104,20 +1119,91 @@ def _model_gguf_repo_candidates(repo_id: str) -> list[tuple[str, str]]:
     return candidates
 
 
-def check_gguf_repo_exists(repo_id: str) -> bool:
-    """Check if a HuggingFace repo exists and has GGUF files."""
+def _base_models_from_tags(tags: list) -> list[str]:
+    """Extract base-model repo ids from HF tags.
+
+    Quant repos carry tags like `base_model:tomaszki/gemma-3` and
+    `base_model:quantized:tomaszki/gemma-3` — the repo id is always the
+    segment after the last colon.
+    """
+    return [
+        t.rsplit(":", 1)[-1].lower()
+        for t in tags
+        if isinstance(t, str) and t.startswith("base_model:")
+    ]
+
+
+_REPO_PARAMS_CACHE: dict[str, int | None] = {}
+_MIRROR_PARAMS_TOLERANCE = 0.30
+
+
+def _repo_total_params(repo_id: str) -> int | None:
+    """Total parameter count of a repo from its safetensors metadata."""
+    if repo_id in _REPO_PARAMS_CACHE:
+        return _REPO_PARAMS_CACHE[repo_id]
+    url = f"{HF_API}/{repo_id}"
+    req = urllib.request.Request(url, headers=_auth_headers())
+    total = None
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            info = json.loads(resp.read().decode())
+            st = info.get("safetensors") or {}
+            raw = st.get("total")
+            total = int(raw) if raw else None
+    except Exception:
+        pass
+    _REPO_PARAMS_CACHE[repo_id] = total
+    return total
+
+
+def check_gguf_repo_exists(
+    repo_id: str,
+    source_repo_id: str | None = None,
+    source_params: int | None = None,
+) -> bool:
+    """Check that a HuggingFace repo exists, has GGUF files, and — when the
+    repo declares `base_model` tags — was actually quantized from
+    `source_repo_id`.
+
+    Candidate repo names are built from the bare model name only, so different
+    orgs' models with the same name (e.g. `tiny-random/gemma-3` vs
+    `tomaszki/gemma-3`) would otherwise be linked to the wrong quant.
+
+    A base_model mismatch is still accepted when the declared base has ~the
+    same parameter count as the source model (`source_params`): that's a
+    mirror/re-upload of the same weights (e.g. unsloth re-uploads pointing at
+    the canonical upstream). Repos without base_model tags are accepted as
+    before (unverifiable).
+    """
     url = f"{HF_API}/{repo_id}"
     req = urllib.request.Request(url, headers=_auth_headers())
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             info = json.loads(resp.read().decode())
             tags = info.get("tags", [])
-            return "gguf" in tags
+            if "gguf" not in tags:
+                return False
+            if source_repo_id:
+                bases = _base_models_from_tags(tags)
+                if bases and source_repo_id.lower() not in bases:
+                    if not source_params:
+                        return False
+                    base_params = next(
+                        (p for p in (_repo_total_params(b) for b in bases) if p),
+                        None,
+                    )
+                    if not base_params:
+                        return False
+                    ratio = base_params / source_params
+                    return abs(ratio - 1.0) <= _MIRROR_PARAMS_TOLERANCE
+            return True
     except Exception:
         return False
 
 
-def _resolve_gguf_sources(repo_id: str) -> tuple[list[dict], list[tuple[str, bool]]]:
+def _resolve_gguf_sources(
+    repo_id: str, source_params: int | None = None
+) -> tuple[list[dict], list[tuple[str, bool]]]:
     """Resolve GGUF sources for a single model repo.
 
     Returns (sources, checks) where checks is [(candidate_repo, exists), ...].
@@ -1125,7 +1211,9 @@ def _resolve_gguf_sources(repo_id: str) -> tuple[list[dict], list[tuple[str, boo
     sources: list[dict] = []
     checks: list[tuple[str, bool]] = []
     for provider, candidate_repo in _model_gguf_repo_candidates(repo_id):
-        exists = check_gguf_repo_exists(candidate_repo)
+        exists = check_gguf_repo_exists(
+            candidate_repo, source_repo_id=repo_id, source_params=source_params
+        )
         checks.append((candidate_repo, exists))
         if exists:
             sources.append({"repo": candidate_repo, "provider": provider})
@@ -1145,7 +1233,7 @@ def enrich_gguf_sources(models: list[dict], threads: int = 1) -> int:
     total = len(models)
     from datetime import datetime, timezone
 
-    to_check: list[tuple[int, str]] = []
+    to_check: list[tuple[int, str, int | None]] = []
 
     for i, model in enumerate(models, 1):
         repo_id = model["name"]
@@ -1159,7 +1247,7 @@ def enrich_gguf_sources(models: list[dict], threads: int = 1) -> int:
             sources = cache[repo_id]["sources"]
             cache_hits += 1
         else:
-            to_check.append((i, repo_id))
+            to_check.append((i, repo_id, model.get("parameters_raw")))
             continue
 
         if sources:
@@ -1179,8 +1267,8 @@ def enrich_gguf_sources(models: list[dict], threads: int = 1) -> int:
                 enriched += 1
 
         if threads <= 1:
-            for idx, repo_id in to_check:
-                sources, checks = _resolve_gguf_sources(repo_id)
+            for idx, repo_id, params_raw in to_check:
+                sources, checks = _resolve_gguf_sources(repo_id, params_raw)
                 print(f"  [{idx}/{total}] {repo_id}")
                 for candidate_repo, exists in checks:
                     mark = "✓" if exists else "✗"
@@ -1191,8 +1279,8 @@ def enrich_gguf_sources(models: list[dict], threads: int = 1) -> int:
             print(f"  Using {threads} threads for GGUF source checks")
             future_to_meta: dict[concurrent.futures.Future, tuple[int, str]] = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-                for idx, repo_id in to_check:
-                    future = executor.submit(_resolve_gguf_sources, repo_id)
+                for idx, repo_id, params_raw in to_check:
+                    future = executor.submit(_resolve_gguf_sources, repo_id, params_raw)
                     future_to_meta[future] = (idx, repo_id)
 
                 for future in concurrent.futures.as_completed(future_to_meta):
@@ -1231,6 +1319,20 @@ PRIMARY_DISCOVER_PIPELINE = "text-generation"
 SKIP_ORGS = {
     "trl-internal-testing",   # Test fixtures
 }
+
+# Markers of CI/test-stub repos: randomly initialized micro-models that look
+# like real model families by name (e.g. `tiny-random/gemma-3` is 9M params).
+# They poison installed-detection and throughput estimates, so they never
+# belong in the catalog regardless of download counts.
+TEST_STUB_MARKERS = ("tiny-random", "tiny-dummy", "-random-init", "ci-random-")
+
+
+def is_test_stub(repo_id: str) -> bool:
+    rid = repo_id.lower()
+    if any(marker in rid for marker in TEST_STUB_MARKERS):
+        return True
+    name = rid.split("/")[-1]
+    return name.startswith(("test-", "testing-", "test_")) or bool(re.match(r"^test\d", name))
 
 # Sort strategies to query — results are merged and deduplicated.
 # Each strategy surfaces models that the others might miss.
@@ -1335,6 +1437,10 @@ def _process_listing(
         stats["skip_org"] += 1
         return None
 
+    if is_test_stub(repo_id):
+        stats["skip_test_stub"] += 1
+        return None
+
     downloads_raw = m.get("downloads")
     downloads = downloads_raw or 0
     if downloads < min_downloads and (require_downloads_floor or downloads_raw is not None):
@@ -1418,6 +1524,7 @@ def discover_trending_models(limit: int = 30, min_downloads: int = 10000) -> lis
         "skip_curated": 0,
         "skip_duplicate": 0,
         "skip_org": 0,
+        "skip_test_stub": 0,
         "skip_downloads": 0,
         "skip_tags": 0,
         "skip_no_params": 0,
@@ -1560,8 +1667,10 @@ def _build_discovered_model(listing: dict) -> dict | None:
     model_format, default_quant = detect_quant_format(repo_id, full_config)
     if pipeline_tag == "text-to-speech":
         model_format, default_quant = ("safetensors", "F16")
-    context_length = (infer_context_length(full_config) if full_config
-                      else infer_context_length(config))
+    context_length = CONTEXT_LENGTH_OVERRIDES.get(
+        repo_id,
+        infer_context_length(full_config) if full_config else infer_context_length(config),
+    )
 
     # Correct parameters_raw when safetensors reports quantized element counts
     arch_params = estimate_params_from_arch(full_config)
@@ -2157,8 +2266,8 @@ def main():
             "provider": "MiniMax", "parameter_count": "230B",
             "parameters_raw": 230000000000,
             "min_ram_gb": 128.6, "recommended_ram_gb": 214.4, "min_vram_gb": 117.9,
-            "quantization": "Q4_K_M", "context_length": 524288,
-            "use_case": "Latest flagship: 512K context, 128K max output, image input",
+            "quantization": "Q4_K_M", "context_length": 1000000,
+            "use_case": "Latest flagship: 1M context, 128K max output, image input",
             "pipeline_tag": "text-generation", "architecture": "minimax",
             "is_moe": True, "num_experts": 32, "active_experts": 2,
             "active_parameters": 10000000000,
@@ -2169,7 +2278,7 @@ def main():
             "provider": "MiniMax", "parameter_count": "230B",
             "parameters_raw": 230000000000,
             "min_ram_gb": 128.6, "recommended_ram_gb": 214.4, "min_vram_gb": 117.9,
-            "quantization": "Q4_K_M", "context_length": 131072,
+            "quantization": "Q4_K_M", "context_length": 204800,
             "use_case": "Previous flagship with enhanced reasoning and coding",
             "pipeline_tag": "text-generation", "architecture": "minimax",
             "is_moe": True, "num_experts": 32, "active_experts": 2,
@@ -2896,5 +3005,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    

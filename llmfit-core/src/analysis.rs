@@ -3,7 +3,7 @@ use crate::hardware::SystemSpecs;
 use crate::models::ModelDatabase;
 use crate::providers::{
     self, DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider,
-    ModelProvider, OllamaProvider, VllmProvider,
+    ModelProvider, OllamaProvider, RamaLamaProvider, VllmProvider,
 };
 use std::collections::HashSet;
 
@@ -25,6 +25,8 @@ pub struct InstalledIndex {
     pub lmstudio_count: usize,
     pub vllm: HashSet<String>,
     pub vllm_count: usize,
+    pub ramalama: HashSet<String>,
+    pub ramalama_count: usize,
 }
 
 impl InstalledIndex {
@@ -42,6 +44,8 @@ impl InstalledIndex {
             lmstudio_count: 0,
             vllm: HashSet::new(),
             vllm_count: 0,
+            ramalama: HashSet::new(),
+            ramalama_count: 0,
         }
     }
 
@@ -73,6 +77,10 @@ impl InstalledIndex {
                 let p = VllmProvider::new();
                 p.installed_models_counted()
             });
+            let ramalama = s.spawn(|| {
+                let p = RamaLamaProvider::new();
+                p.installed_models_counted()
+            });
 
             let (ollama, ollama_count) = ollama.join().unwrap();
             let mlx = mlx.join().unwrap();
@@ -80,6 +88,7 @@ impl InstalledIndex {
             let (docker_mr, docker_mr_count) = docker_mr.join().unwrap();
             let (lmstudio, lmstudio_count) = lmstudio.join().unwrap();
             let (vllm, vllm_count) = vllm.join().unwrap();
+            let (ramalama, ramalama_count) = ramalama.join().unwrap();
 
             Self {
                 ollama,
@@ -93,6 +102,8 @@ impl InstalledIndex {
                 lmstudio_count,
                 vllm,
                 vllm_count,
+                ramalama,
+                ramalama_count,
             }
         })
     }
@@ -105,6 +116,7 @@ impl InstalledIndex {
             || providers::is_model_installed_docker_mr(model_name, &self.docker_mr)
             || providers::is_model_installed_lmstudio(model_name, &self.lmstudio)
             || providers::is_model_installed_vllm(model_name, &self.vllm)
+            || providers::is_model_installed_ramalama(model_name, &self.ramalama)
     }
 
     /// Returns the display names of all providers that have this model
@@ -129,6 +141,9 @@ impl InstalledIndex {
         if providers::is_model_installed_vllm(model_name, &self.vllm) {
             out.push("vLLM");
         }
+        if providers::is_model_installed_ramalama(model_name, &self.ramalama) {
+            out.push("RamaLama");
+        }
         out
     }
 }
@@ -147,14 +162,107 @@ pub fn build_model_fits(
 ) -> Vec<ModelFit> {
     use crate::fit::backend_compatible;
 
-    db.get_all_models()
+    // Measured-throughput sources, most trustworthy first: the user's own
+    // runs on this machine, llmfit community submissions recorded on
+    // identical hardware, then localmaxxing medians on matching presets.
+    let local_index = crate::share::LocalBenchIndex::load(specs);
+    let community_index = crate::benchmarks::CommunityBenchIndex::for_specs(specs);
+    let measured_index = crate::benchmarks::MeasuredTpsIndex::for_specs(specs);
+
+    let mut fits: Vec<ModelFit> = db
+        .get_all_models()
         .iter()
         .filter(|m| backend_compatible(m, specs))
         .map(|m| {
             let mut fit =
                 ModelFit::analyze_with_forced_runtime(m, specs, context_limit, forced_runtime);
             fit.installed = installed.is_installed(&m.name);
+            fit.measured_tps = local_index
+                .as_ref()
+                .and_then(|idx| idx.lookup(&m.name))
+                .or_else(|| community_index.as_ref().and_then(|idx| idx.lookup(&m.name)))
+                .or_else(|| {
+                    measured_index
+                        .as_ref()
+                        .and_then(|idx| idx.lookup(&m.name, &fit.best_quant))
+                });
             fit
         })
-        .collect()
+        .collect();
+    apply_local_calibration(&mut fits);
+    fits
+}
+
+/// Calibrate formula estimates from benchmark runs made on this exact
+/// hardware: the user's own local runs, plus llmfit community submissions
+/// recorded on an identical configuration (so a fresh install benefits the
+/// moment anyone contributed on the same machine class).
+///
+/// Anchors must map to a catalog entry with a trustworthy size (>= 1B
+/// params, dense — MoE and tiny models don't scale like bandwidth-bound
+/// dense generation). The median measured/estimated ratio, clamped to
+/// [0.05, 3.0], scales every row's estimate and is recorded in
+/// `estimate_basis.local_calibration`.
+///
+/// Idempotent: ratios and scaling always derive from the uncalibrated
+/// estimate, so re-applying after a new bench never compounds.
+pub fn apply_local_calibration(fits: &mut [ModelFit]) {
+    use crate::benchmarks::MeasuredSource;
+
+    fn uncalibrated(f: &ModelFit) -> f64 {
+        match f.estimate_basis.local_calibration {
+            Some(c) if c > 0.0 => f.estimated_tps / c,
+            _ => f.estimated_tps,
+        }
+    }
+
+    let mut ratios: Vec<f64> = fits
+        .iter()
+        .filter(|f| f.model.params_b() >= 1.0 && !f.model.is_moe)
+        .filter_map(|f| {
+            let m = f.measured_tps.as_ref()?;
+            if !matches!(
+                m.source,
+                MeasuredSource::LocalBench | MeasuredSource::CommunityLlmfit
+            ) {
+                return None;
+            }
+            let est = uncalibrated(f);
+            (est > 0.0 && m.tok_s > 0.0).then(|| m.tok_s / est)
+        })
+        .collect();
+    if ratios.is_empty() {
+        return;
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).expect("ratios are finite"));
+    let factor = median(&ratios).clamp(0.05, 3.0);
+
+    for f in fits.iter_mut() {
+        if f.estimated_tps <= 0.0 {
+            continue;
+        }
+        f.estimated_tps = uncalibrated(f) * factor;
+        f.estimate_basis.local_calibration = Some(factor);
+    }
+}
+
+fn median(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::*;
+
+    #[test]
+    fn median_of_sorted() {
+        assert_eq!(median(&[0.1]), 0.1);
+        assert_eq!(median(&[0.1, 0.3]), 0.2);
+        assert_eq!(median(&[0.1, 0.2, 0.9]), 0.2);
+    }
 }
