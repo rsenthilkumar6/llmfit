@@ -1798,6 +1798,7 @@ mod tests {
             has_gpu,
             gpu_vram_gb: vram,
             total_gpu_vram_gb: vram, // same as gpu_vram_gb for single-GPU tests
+            gpu_available_gb: None,
             gpu_name: if has_gpu {
                 Some("Test GPU".to_string())
             } else {
@@ -2515,6 +2516,7 @@ mod tests {
             has_gpu: true,
             gpu_vram_gb: Some(vram_gb),
             total_gpu_vram_gb: Some(vram_gb),
+            gpu_available_gb: None,
             gpu_name: Some(name.to_string()),
             gpu_count: 1,
             unified_memory: unified,
@@ -2901,6 +2903,7 @@ mod tests {
             has_gpu: true,
             gpu_vram_gb: Some(vram),
             total_gpu_vram_gb: Some(vram),
+            gpu_available_gb: None,
             gpu_name: Some(gpu_name.to_string()),
             gpu_count: 1,
             unified_memory: false,
@@ -3485,6 +3488,7 @@ mod tests {
             has_gpu: true,
             gpu_vram_gb: Some(16.0),
             total_gpu_vram_gb: Some(16.0),
+            gpu_available_gb: None,
             gpu_name: Some("AMD Radeon RX 6900 XT".to_string()),
             gpu_count: 1,
             unified_memory: false,

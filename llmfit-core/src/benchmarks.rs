@@ -967,6 +967,7 @@ mod tests {
             has_gpu: gpu.is_some(),
             gpu_vram_gb: None,
             total_gpu_vram_gb: None,
+            gpu_available_gb: None,
             gpu_name: gpu.map(str::to_string),
             gpu_count: u32::from(gpu.is_some()),
             unified_memory: false,

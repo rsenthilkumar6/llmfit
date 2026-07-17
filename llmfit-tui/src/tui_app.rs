@@ -5026,6 +5026,7 @@ mod tests {
                 has_gpu: false,
                 gpu_vram_gb: None,
                 total_gpu_vram_gb: None,
+                gpu_available_gb: None,
                 gpu_name: None,
                 gpu_count: 0,
                 unified_memory: false,

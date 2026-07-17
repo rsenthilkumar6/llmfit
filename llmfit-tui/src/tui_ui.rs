@@ -104,12 +104,14 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
         let primary = &app.specs.gpus[0];
         let backend = primary.backend.label();
         let primary_str = if primary.unified_memory {
-            format!(
-                "{} ({:.1} GB shared, {})",
-                primary.name,
-                primary.vram_gb.unwrap_or(0.0),
-                backend
-            )
+            let shared = primary.vram_gb.unwrap_or(0.0);
+            match app.specs.gpu_available_gb {
+                Some(available) => format!(
+                    "{} ({:.1} GB GPU-available / {:.1} GB shared, {})",
+                    primary.name, available, shared, backend
+                ),
+                None => format!("{} ({:.1} GB shared, {})", primary.name, shared, backend),
+            }
         } else {
             match primary.vram_gb {
                 Some(vram) if vram > 0.0 => {
