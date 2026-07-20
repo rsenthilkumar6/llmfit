@@ -32,7 +32,7 @@ Launches the interactive terminal UI. Your system specs (CPU, RAM, GPU name, VRA
 | `R`                        | Open runtime/backend filter popup (llama.cpp, MLX, vLLM)             |
 | `S`                        | Open hardware simulation popup (override RAM/VRAM/CPU)                |
 | `A`                        | Open advanced configuration popup (tune efficiency, run mode factors) |
-| `b`                        | Open community leaderboard view (localmaxxing.com)                    |
+| `b`                        | Open community leaderboard view (measured community results)          |
 | `I`                        | Open inference bench view (local quality scoring against your models) |
 | `h`                        | Open help popup (all key bindings)                                    |
 | `m`                        | Mark selected model for compare                                       |
@@ -176,7 +176,9 @@ Press `b` to open the Community Leaderboard view. Instead of relying solely on l
 
 ![Community Leaderboard](../assets/benchmark.jpeg)
 
-Data is sourced from [localmaxxing.com](https://localmaxxing.com), a community benchmark database. When you open the view, llmfit auto-detects your hardware (GPU model, VRAM tier, Apple Silicon chip family, OS) and queries for matching results.
+Results come primarily from the **llmfit community**: benchmarks contributed via [`bench --share`](benchmarking.md) are merged into the repo and embedded into each release, so they show up as `llmfit community` rows for anyone on identical hardware — alongside your own runs (`you (local)` / `you (shared)`). This data is supplemented with results from [localmaxxing.com](https://localmaxxing.com), a public benchmark database. When you open the view, llmfit auto-detects your hardware (GPU model, VRAM tier, Apple Silicon chip family, OS) and shows matching results.
+
+Where numbers disagree, llmfit trusts: your own runs > llmfit community on identical hardware > localmaxxing medians > formula estimates.
 
 | Column       | Description                                              |
 |--------------|----------------------------------------------------------|
@@ -199,9 +201,20 @@ Data is sourced from [localmaxxing.com](https://localmaxxing.com), a community b
 
 Press `H` to open the hardware picker — a scrollable list of 27 popular GPUs and chips (RTX 5090 through CPU-only, plus Apple Silicon M1–M4 variants, AMD RX/MI series, and NVIDIA datacenter cards). Select one to instantly load benchmarks for that hardware, even if it's not what you're running on. Select "My Hardware (auto-detect)" to go back to your own system.
 
-#### API key setup
+#### Benchmark this model
 
-Public benchmarks work without authentication. For full access, provide your [localmaxxing.com](https://localmaxxing.com) API key:
+If the selected model is installed and its runtime provider is live when you press `b`, llmfit first offers to benchmark it — measuring real tok/s and TTFT with three live inference runs, with an optional share-as-PR step. See the [step-by-step benchmarking guide](benchmarking.md) for the full journey with screenshots.
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Start the benchmark |
+| `Space` / `s` | Toggle sharing results as a GitHub PR |
+| `Esc` / `n` | Skip and go straight to the leaderboard |
+| `Esc` (while running) | Continue the benchmark in the background |
+
+#### localmaxxing API key (optional)
+
+Community and local results need no account or authentication. The supplemental localmaxxing.com data works unauthenticated too; for full access to it, provide an API key:
 
 ```sh
 # Via environment variable (recommended)

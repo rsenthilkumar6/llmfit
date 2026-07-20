@@ -17,7 +17,7 @@
   <a href="https://about.signpath.io"><img src="https://img.shields.io/badge/SignPath-signed-brightgreen?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0id2hpdGUiIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggZD0iTTEwLjA2NyA0LjU2N2wtNC43MzQgNC43MzMtMS40LTEuNGExIDEgMCAwIDAtMS40MTQgMS40MTRsMi4xIDIuMWExIDEgMCAwIDAgMS40MTQgMGw1LjQ0LTUuNDRhMSAxIDAgMCAwLTEuNDE0LTEuNDE0eiIvPjwvc3ZnPg==" alt="Signed with SignPath"></a>
 </p>
 
-> **📊 New: benchmark & share — real numbers from your machine, better estimates for everyone.** `llmfit bench --share` measures real tok/s on your hardware and contributes it back to the project as a PR — no `gh` CLI, no third-party account. Every run is saved locally first (skip sharing, upload the backlog any time), your own measurements replace estimates in the fit table, and each merged submission ships in the next release: anyone on identical hardware gets measured `✓` numbers and calibrated estimates before they ever run a benchmark. [Get started with sharing →](docs/cli.md#contributing-benchmarks-bench---share)
+> **📊 New: benchmark & share — real numbers from your machine, better estimates for everyone.** Download a model, serve it, and measure real tok/s on your hardware — then contribute the results back to the project as a PR, straight from the TUI. No `gh` CLI, no third-party account. Every run is saved locally first, your own measurements replace estimates in the fit table, and each merged submission ships in the next release: anyone on identical hardware gets measured `✓` numbers before they ever run a benchmark. [Follow the step-by-step benchmarking guide →](docs/benchmarking.md)
 >
 > *Previously: [llmfit 1.0 — the release where the numbers became verifiable →](https://github.com/AlexsJones/llmfit/discussions/708)*
 
@@ -39,7 +39,7 @@ Ships with an interactive TUI (default) and a classic CLI mode. Supports multi-G
 |  |  |
 |---|---|
 | **Get started** | [Install](#install) · [Usage](#usage) · [How it works](#how-it-works) |
-| **Guides** | [TUI guide](docs/tui.md) · [CLI & automation](docs/cli.md) · [Runtime providers](docs/providers.md) · [OpenClaw integration](docs/openclaw.md) |
+| **Guides** | [TUI guide](docs/tui.md) · [Benchmarking step-by-step](docs/benchmarking.md) · [CLI & automation](docs/cli.md) · [Runtime providers](docs/providers.md) · [OpenClaw integration](docs/openclaw.md) |
 | **Reference** | [How it works (full)](docs/how-it-works.md) · [Platform & GPU support](docs/platform-support.md) · [Custom models](docs/custom-models.md) · [Development](docs/development.md) |
 | **Project** | [Contributing](#contributing) · [Alternatives](#alternatives) · [Code signing](#code-signing) · [License](#license) |
 
