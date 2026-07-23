@@ -1035,6 +1035,10 @@ pub struct App {
     /// Index into HardwarePreset::all() when the picker is open.
     pub bench_hw_picker_cursor: usize,
     pub bench_hw_picker_open: bool,
+    /// `/` filter over the leaderboard rows (model, engine, quant, user).
+    pub bench_search_query: String,
+    /// True while the `/` search box is capturing keystrokes.
+    pub bench_search_active: bool,
 
     // Live inference-bench view (llmfit bench — distinct from community benchmarks above)
     pub show_bench: bool,
@@ -1543,6 +1547,8 @@ impl App {
             bench_hw_label: None,
             bench_hw_picker_cursor: 0,
             bench_hw_picker_open: false,
+            bench_search_query: String::new(),
+            bench_search_active: false,
             // Live inference-bench view
             show_bench: false,
             bench_model_status: Vec::new(),
@@ -2072,6 +2078,38 @@ impl App {
             || has_runtime_filter
     }
 
+    /// Human-readable labels for the active advanced range filters from the
+    /// `F` popup, e.g. `["≤2B", "mem≥50%"]`. Empty when no range is set.
+    /// These constrain every fit category, so the UI shows them explicitly
+    /// rather than as a cryptic marker.
+    pub fn advanced_range_labels(&self) -> Vec<String> {
+        fn range(min: &str, max: &str, prefix: &str, unit: &str) -> Option<String> {
+            match (min.is_empty(), max.is_empty()) {
+                (false, false) => Some(format!("{prefix}{min}–{max}{unit}")),
+                (false, true) => Some(format!("{prefix}≥{min}{unit}")),
+                (true, false) => Some(format!("{prefix}≤{max}{unit}")),
+                (true, true) => None,
+            }
+        }
+        [
+            range(
+                &self.filter_params_min_input,
+                &self.filter_params_max_input,
+                "",
+                "B",
+            ),
+            range(
+                &self.filter_mem_pct_min_input,
+                &self.filter_mem_pct_max_input,
+                "mem",
+                "%",
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     pub fn cycle_sort_column(&mut self) {
         self.sort_column = self.sort_column.next();
         self.sort_ascending = false;
@@ -2403,6 +2441,8 @@ impl App {
         self.input_mode = InputMode::Benchmarks;
         self.bench_cursor = 0;
         self.bench_scroll = 0;
+        self.bench_search_query.clear();
+        self.bench_search_active = false;
 
         // If the selected model is installed and a provider has it, offer to
         // benchmark it (with optional share-as-PR) before showing the board.
@@ -2453,6 +2493,16 @@ impl App {
     pub fn close_benchmarks(&mut self) {
         self.show_benchmarks = false;
         self.input_mode = InputMode::Normal;
+        // Leaving the leaderboard drops any simulated card: the top bar goes
+        // back to the detected GPU, and the cached preset rows are discarded
+        // so the next open refetches for the real hardware.
+        if self.bench_hw_label.take().is_some() {
+            self.bench_entries.clear();
+            self.bench_total = 0;
+            self.bench_cursor = 0;
+            self.bench_scroll = 0;
+            self.bench_error = None;
+        }
     }
 
     /// Toggle the "share with llmfit" checkbox in the bench-offer modal.
@@ -2668,8 +2718,9 @@ impl App {
         }
         local.append(&mut self.bench_entries);
         self.bench_entries = local;
-        if self.bench_cursor >= self.bench_entries.len() {
-            self.bench_cursor = self.bench_entries.len().saturating_sub(1);
+        let visible = self.bench_visible_indices().len();
+        if self.bench_cursor >= visible {
+            self.bench_cursor = visible.saturating_sub(1);
         }
     }
 
@@ -2708,9 +2759,67 @@ impl App {
     }
 
     pub fn bench_move_down(&mut self) {
-        if !self.bench_entries.is_empty() && self.bench_cursor < self.bench_entries.len() - 1 {
+        let visible = self.bench_visible_indices().len();
+        if visible > 0 && self.bench_cursor < visible - 1 {
             self.bench_cursor += 1;
         }
+    }
+
+    /// Indices into `bench_entries` that match the `/` search. Same semantics
+    /// as the main table search: space-separated terms, all must appear
+    /// (case-insensitive) somewhere in the row's searchable text.
+    pub fn bench_visible_indices(&self) -> Vec<usize> {
+        let query = self.bench_search_query.to_lowercase();
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        self.bench_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                if terms.is_empty() {
+                    return true;
+                }
+                let haystack = format!(
+                    "{} {} {} {}",
+                    e.hf_id().to_lowercase(),
+                    e.engine_name().to_lowercase(),
+                    e.quantization().to_lowercase(),
+                    e.username().to_lowercase(),
+                );
+                terms.iter().all(|t| haystack.contains(t))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn bench_search_start(&mut self) {
+        self.bench_search_active = true;
+    }
+
+    /// Accept the current query and return to list navigation; the filter
+    /// stays applied until cleared with Esc or the view is reopened.
+    pub fn bench_search_accept(&mut self) {
+        self.bench_search_active = false;
+    }
+
+    pub fn bench_search_clear(&mut self) {
+        self.bench_search_active = false;
+        self.bench_search_query.clear();
+        self.bench_cursor = 0;
+        self.bench_scroll = 0;
+    }
+
+    pub fn bench_search_input(&mut self, c: char) {
+        if c.is_ascii_graphic() || c == ' ' {
+            self.bench_search_query.push(c);
+            self.bench_cursor = 0;
+            self.bench_scroll = 0;
+        }
+    }
+
+    pub fn bench_search_backspace(&mut self) {
+        self.bench_search_query.pop();
+        self.bench_cursor = 0;
+        self.bench_scroll = 0;
     }
 
     pub fn bench_refresh(&mut self) {
@@ -4085,7 +4194,12 @@ impl App {
         let is_mlx_model = fit.model.is_mlx_model();
         let has_catalog_gguf = !fit.model.gguf_sources.is_empty();
 
-        let download_options = self.available_download_providers(&model_name, has_catalog_gguf);
+        let download_options = self.available_download_providers(
+            &model_name,
+            model_format,
+            is_mlx_model,
+            has_catalog_gguf,
+        );
         if !download_options.is_empty() {
             self.open_download_provider_popup(model_name, download_options);
         } else {
@@ -4350,6 +4464,8 @@ impl App {
     fn available_download_providers(
         &self,
         model_name: &str,
+        model_format: llmfit_core::models::ModelFormat,
+        is_mlx_model: bool,
         has_catalog_gguf: bool,
     ) -> Vec<DownloadProvider> {
         let mut providers_for_model = Vec::new();
@@ -4358,7 +4474,13 @@ impl App {
         {
             providers_for_model.push(DownloadProvider::Ollama);
         }
-        if self.mlx_available {
+        // AWQ/GPTQ/AutoRound are vLLM/CUDA formats with no MLX equivalent to
+        // guess — offering MLX for them fabricates a nonexistent
+        // mlx-community repo (issue #294). Scanned HF models default to
+        // ModelFormat::Gguf, so the name is checked as well as the format.
+        let prequantized = model_format.is_prequantized()
+            || providers::is_likely_prequantized_repo(&model_name.to_lowercase());
+        if self.mlx_available && (is_mlx_model || !prequantized) {
             providers_for_model.push(DownloadProvider::Mlx);
         }
         // Check catalog gguf_sources first (no HTTP probe needed), then
@@ -5104,6 +5226,68 @@ mod tests {
         }
     }
 
+    // ── available_download_providers MLX gating (issue #294) ─────────
+
+    fn mlx_only_app() -> App {
+        let mut app = test_app();
+        app.mlx_available = true;
+        // Keep every other provider off so no network probe runs and the
+        // returned options are exactly the MLX decision.
+        app.ollama_available = false;
+        app.ollama_binary_available = false;
+        app.llamacpp_available = false;
+        app.docker_mr_available = false;
+        app.lmstudio_available = false;
+        app.vllm_available = false;
+        app
+    }
+
+    #[test]
+    fn awq_named_model_is_not_offered_mlx_download() {
+        let app = mlx_only_app();
+        // The #294 model: format comes back as the Gguf default for scanned
+        // HF models, so the name heuristic must catch it.
+        let options = app.available_download_providers(
+            "cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit",
+            ModelFormat::Gguf,
+            false,
+            true,
+        );
+        assert!(options.is_empty(), "got: {options:?}");
+    }
+
+    #[test]
+    fn awq_format_model_is_not_offered_mlx_download() {
+        let app = mlx_only_app();
+        let options =
+            app.available_download_providers("some/quantized-model", ModelFormat::Awq, false, true);
+        assert!(options.is_empty(), "got: {options:?}");
+    }
+
+    #[test]
+    fn plain_model_is_offered_mlx_download() {
+        let app = mlx_only_app();
+        let options = app.available_download_providers(
+            "meta-llama/Llama-3.1-8B-Instruct",
+            ModelFormat::Gguf,
+            false,
+            true,
+        );
+        assert_eq!(options, vec![DownloadProvider::Mlx]);
+    }
+
+    #[test]
+    fn mlx_conversion_keeping_awq_in_name_is_still_offered() {
+        let app = mlx_only_app();
+        let options = app.available_download_providers(
+            "mlx-community/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit-MLX",
+            ModelFormat::Gguf,
+            true,
+            true,
+        );
+        assert_eq!(options, vec![DownloadProvider::Mlx]);
+    }
+
     #[test]
     fn initial_best_fit_row_selects_highest_scoring_perfect_or_good_fit() {
         let fits = vec![
@@ -5419,5 +5603,136 @@ mod tests {
             "/home/user/.cache/llmfit/models/gemma-3.Q8_0.gguf",
             "google/gemma-3-27b-it"
         ));
+    }
+
+    fn bench_entry(
+        id: &str,
+        model: &str,
+        engine: &str,
+        user: &str,
+    ) -> llmfit_core::benchmarks::LeaderboardEntry {
+        use llmfit_core::benchmarks::{
+            LeaderboardEngine, LeaderboardEntry, LeaderboardModel, LeaderboardUser,
+        };
+        LeaderboardEntry {
+            id: id.to_string(),
+            tok_s_out: Some(10.0),
+            tok_s_total: None,
+            ttft_ms: None,
+            context_length: None,
+            batch_size: None,
+            peak_vram_gb: None,
+            notes: None,
+            model: Some(LeaderboardModel {
+                hf_id: model.to_string(),
+                display_name: None,
+                family: None,
+                params: None,
+                is_mo_e: None,
+            }),
+            hardware: None,
+            engine: Some(LeaderboardEngine {
+                engine_name: engine.to_string(),
+                engine_version: None,
+                quantization: "Q4_K_M".to_string(),
+                backend: None,
+            }),
+            engine_flags: None,
+            user: Some(LeaderboardUser {
+                username: Some(user.to_string()),
+                verified: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn bench_search_filters_by_model_engine_and_user() {
+        let mut app = test_app();
+        app.bench_entries = vec![
+            bench_entry("1", "meta-llama/Llama-3.1-8B", "ollama", "alice"),
+            bench_entry("2", "Qwen/Qwen2.5-7B", "llama.cpp", "bob"),
+            bench_entry("3", "meta-llama/Llama-3.1-70B", "vllm", "carol"),
+        ];
+
+        // Empty query shows everything
+        assert_eq!(app.bench_visible_indices(), vec![0, 1, 2]);
+
+        // Case-insensitive substring on the model id
+        app.bench_search_query = "LLAMA-3.1".to_string();
+        assert_eq!(app.bench_visible_indices(), vec![0, 2]);
+
+        // AND across space-separated terms (model + engine)
+        app.bench_search_query = "llama-3.1 vllm".to_string();
+        assert_eq!(app.bench_visible_indices(), vec![2]);
+
+        // Username matches too
+        app.bench_search_query = "bob".to_string();
+        assert_eq!(app.bench_visible_indices(), vec![1]);
+
+        app.bench_search_query = "nomatch".to_string();
+        assert!(app.bench_visible_indices().is_empty());
+    }
+
+    #[test]
+    fn advanced_range_labels_spell_out_active_ranges() {
+        let mut app = test_app();
+        assert!(app.advanced_range_labels().is_empty());
+
+        app.filter_params_max_input = "2".to_string();
+        assert_eq!(app.advanced_range_labels(), vec!["≤2B"]);
+
+        app.filter_params_min_input = "7".to_string();
+        app.filter_params_max_input = "30".to_string();
+        app.filter_mem_pct_min_input = "50".to_string();
+        assert_eq!(app.advanced_range_labels(), vec!["7–30B", "mem≥50%"]);
+    }
+
+    #[test]
+    fn closing_benchmarks_resets_simulated_card_and_cached_rows() {
+        let mut app = test_app();
+        app.bench_hw_label = Some("RTX 5080 (16 GB)".to_string());
+        app.bench_entries = vec![bench_entry("1", "Qwen/Qwen3.6-35B-A3B", "llama.cpp", "bob")];
+        app.bench_total = 12;
+        app.bench_cursor = 1;
+
+        app.close_benchmarks();
+        assert!(app.bench_hw_label.is_none());
+        assert!(app.bench_entries.is_empty());
+        assert_eq!(app.bench_total, 0);
+        assert_eq!(app.bench_cursor, 0);
+
+        // Without a simulated card the cached board is kept.
+        app.bench_entries = vec![bench_entry("1", "Qwen/Qwen3.6-35B-A3B", "llama.cpp", "bob")];
+        app.close_benchmarks();
+        assert_eq!(app.bench_entries.len(), 1);
+    }
+
+    #[test]
+    fn bench_search_edits_reset_cursor_and_clear_restores() {
+        let mut app = test_app();
+        app.bench_entries = vec![
+            bench_entry("1", "meta-llama/Llama-3.1-8B", "ollama", "alice"),
+            bench_entry("2", "Qwen/Qwen2.5-7B", "llama.cpp", "bob"),
+        ];
+        app.bench_cursor = 1;
+        app.bench_search_start();
+        assert!(app.bench_search_active);
+
+        app.bench_search_input('q');
+        app.bench_search_input('w');
+        assert_eq!(app.bench_cursor, 0);
+        assert_eq!(app.bench_visible_indices(), vec![1]);
+
+        // Cursor moves are bounded by the filtered list, not all entries
+        app.bench_move_down();
+        assert_eq!(app.bench_cursor, 0);
+
+        app.bench_search_accept();
+        assert!(!app.bench_search_active);
+        assert_eq!(app.bench_search_query, "qw");
+
+        app.bench_search_clear();
+        assert!(app.bench_search_query.is_empty());
+        assert_eq!(app.bench_visible_indices(), vec![0, 1]);
     }
 }

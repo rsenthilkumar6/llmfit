@@ -6,13 +6,17 @@ on:
       - main    # Run after merging into the "main" target
     paths:      # Run only if files relevant to CI have changed (i.e. not install.sh, scripts or .github/workflows)
       - 'llmfit-*/**'
-      - 'Cargo.{lock,toml}'
+      # Listed separately: workflow path filters have no brace expansion.
+      - 'Cargo.lock'
+      - 'Cargo.toml'
   pull_request:
     branches:
       - main    # Run in PRs targeting the "main" branch
     paths:
       - 'llmfit-*/**'
-      - 'Cargo.{lock,toml}'
+      # Listed separately: workflow path filters have no brace expansion.
+      - 'Cargo.lock'
+      - 'Cargo.toml'
     types:      # Avoid low-impact events like "edited" or "labeled"
       - opened
       - synchronize
@@ -36,7 +40,7 @@ jobs:
 
       - name: Filter changed paths
         id: filter
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         with:
           filters: |
             rust:

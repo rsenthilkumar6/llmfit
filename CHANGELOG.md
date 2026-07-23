@@ -1,5 +1,49 @@
 # Changelog
 
+## [1.1.6](https://github.com/AlexsJones/llmfit/compare/v1.1.5...v1.1.6) (2026-07-21)
+
+
+### Features
+
+* **tui:** [SIMULATED] GPU indicator and / search in the community leaderboard ([7584ce8](https://github.com/AlexsJones/llmfit/commit/7584ce803539dba79c8cb640079ee5bb26490420))
+* **tui:** [SIMULATED] GPU indicator and / search in the community leaderboard ([c3bcb14](https://github.com/AlexsJones/llmfit/commit/c3bcb1414543fbffe06ea67669de76491da3c548))
+
+
+### Bug Fixes
+
+* **tui:** let plan-mode text fields accept q/j/k instead of treating them as bindings ([7b8491f](https://github.com/AlexsJones/llmfit/commit/7b8491f6d6c3c2238dcb0ddda4bcf798a2f13b2a)), closes [#781](https://github.com/AlexsJones/llmfit/issues/781)
+* **tui:** plan-mode text fields no longer treat q/j/k as bindings ([cac6b58](https://github.com/AlexsJones/llmfit/commit/cac6b5894670ecfb9f1d9b5b0c1e9d69c32e88f6))
+
+## [1.1.5](https://github.com/AlexsJones/llmfit/compare/v1.1.4...v1.1.5) (2026-07-20)
+
+
+### Bug Fixes
+
+* don't offer MLX downloads for AWQ/GPTQ repos; verify the mlx-community fallback exists before pulling ([1cc50ff](https://github.com/AlexsJones/llmfit/commit/1cc50ffc122c8d77eeb85916884005b29daef4a1))
+* **providers,tui:** stop offering MLX downloads for AWQ/GPTQ repos and verify the mlx-community fallback exists ([e36d832](https://github.com/AlexsJones/llmfit/commit/e36d8325b873c68d8cd2f2d35765cca157e6ba26)), closes [#294](https://github.com/AlexsJones/llmfit/issues/294)
+
+## [1.1.4](https://github.com/AlexsJones/llmfit/compare/v1.1.3...v1.1.4) (2026-07-19)
+
+
+### Features
+
+* **api:** expose usable_context and effective_context_length in the models envelope ([086def6](https://github.com/AlexsJones/llmfit/commit/086def6858a654bcad13ad2cd151b5b0690e2e34))
+* **api:** unify fit envelope serializers, exposing parity fields on REST/MCP ([2fb0a1c](https://github.com/AlexsJones/llmfit/commit/2fb0a1ca958286bfa28d56b2f1f9be5521857844))
+* **api:** unify fit envelope serializers, exposing parity fields on REST/MCP ([c6bdccc](https://github.com/AlexsJones/llmfit/commit/c6bdccc2cb501ea63ad9936d3281c4e6237ab609))
+* **cli:** expose usable_context and effective_context_length in JSON ([edcd6ef](https://github.com/AlexsJones/llmfit/commit/edcd6efebe0315d44b98753483c94a28f718c552))
+* **core:** report macOS GPU-available unified memory ([2e845e7](https://github.com/AlexsJones/llmfit/commit/2e845e73ffc5564214be4d4deac690f855af098a))
+* **core:** report macOS GPU-available unified memory ([f082483](https://github.com/AlexsJones/llmfit/commit/f082483c77e58c2015b7de303c7c4c88d7cf0627))
+
+
+### Bug Fixes
+
+* **ci:** list Cargo.lock/Cargo.toml separately in workflow path filters ([1af2174](https://github.com/AlexsJones/llmfit/commit/1af21740a95fca88cd8ebcad3342cfde868324db))
+* **ci:** list Cargo.lock/Cargo.toml separately in workflow path filters ([6d1cb1c](https://github.com/AlexsJones/llmfit/commit/6d1cb1cf3684d5c96ba4d6c71026aa00366c9e10))
+* **core:** clamp GPU-available display to the shared pool ([7d188b5](https://github.com/AlexsJones/llmfit/commit/7d188b5683b6f3de524d5a4af4771caee80293b2))
+* **core:** clear gpu_available_gb on overrides; drop redundant sysctl check ([c67a4eb](https://github.com/AlexsJones/llmfit/commit/c67a4eb4357e7f1054881c216b7e90af47839cdb))
+* **tui:** force a full clear after entering the alternate screen ([34df3dc](https://github.com/AlexsJones/llmfit/commit/34df3dc6ff1377108bb6892fca5e69fc384a59c1))
+* **tui:** force a full clear after entering the alternate screen ([ebf045c](https://github.com/AlexsJones/llmfit/commit/ebf045cf5ddb40b1d13a3689f41b376c45de6fc4)), closes [#732](https://github.com/AlexsJones/llmfit/issues/732)
+
 ## [1.1.3](https://github.com/AlexsJones/llmfit/compare/v1.1.2...v1.1.3) (2026-07-14)
 
 

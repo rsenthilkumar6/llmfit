@@ -2,11 +2,10 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use colored::*;
-use llmfit_core::fit::{FitLevel, InferenceRuntime, ModelFit, RunMode, SortColumn};
+use llmfit_core::fit::{FitLevel, ModelFit, RunMode, SortColumn};
 use llmfit_core::hardware::SystemSpecs;
 use llmfit_core::models::LlmModel;
 use llmfit_core::plan::PlanEstimate;
-use llmfit_core::providers::ollama_pull_tag as ollama_name_for;
 use tabled::{Table, Tabled, settings::Style};
 
 #[derive(Tabled)]
@@ -630,7 +629,7 @@ fn display_estimate_basis(fit: &ModelFit) {
         "    llmfit bench \"{}\"    (against a running provider)",
         fit.model.name
     );
-    if let Some(bench_cmd) = generate_llamabench_command(fit) {
+    if let Some(bench_cmd) = crate::serve_shared::generate_llamabench_command(fit) {
         println!(
             "    {}    (compare the tg128 row; get the path via `llmfit download`)",
             bench_cmd
@@ -667,30 +666,6 @@ fn generate_llamacpp_command(fit: &ModelFit) -> Option<String> {
             repo, quant, ngl_args, context, conversation_arg
         )
     })
-}
-
-/// llama-bench invocation that measures the same quantity `estimated_tps`
-/// models: single-request generation throughput (the `tg128` row). Prompt
-/// processing (`pp512`) is deliberately not what llmfit estimates.
-///
-/// Only emitted for pure-GPU and CPU-only runs — offload splits depend on
-/// llama.cpp's layer placement, which llama-bench can't express with a fixed
-/// `-ngl`, so a benchmark there wouldn't be comparable to the estimate.
-fn generate_llamabench_command(fit: &ModelFit) -> Option<String> {
-    if fit.runtime != InferenceRuntime::LlamaCpp {
-        return None;
-    }
-    let ngl = match fit.run_mode {
-        RunMode::Gpu => "99",
-        RunMode::CpuOnly => "0",
-        _ => return None,
-    };
-    // llama-bench needs a local GGUF path (no -hf support); point users at
-    // `llmfit download`, which prints the destination path.
-    Some(format!(
-        "llama-bench -m <path-to-{}-gguf> -ngl {} -p 512 -n 128",
-        fit.best_quant, ngl
-    ))
 }
 
 fn llamacpp_ngl_args(run_mode: RunMode) -> Option<&'static str> {
@@ -803,49 +778,33 @@ fn system_json(specs: &SystemSpecs) -> serde_json::Value {
     crate::serve_shared::system_json(specs)
 }
 
+/// CLI `fit --json` envelope: the shared serializer plus this frontend's legacy
+/// overlays. The overlaid keys carry human-readable strings the API/MCP side
+/// expresses as machine codes (with the human string under a `*_label` key);
+/// the CLI's overloaded values are load-bearing for existing scripts, so they
+/// stay put here until a future PR deprecates them (see #759).
 fn fit_to_json(fit: &ModelFit) -> serde_json::Value {
-    serde_json::json!({
-        "name": fit.model.name,
-        "provider": fit.model.provider,
-        "parameter_count": fit.model.parameter_count,
-        "params_b": round2(fit.model.params_b()),
-        "context_length": fit.model.context_length,
-        "effective_context_length": fit.effective_context_length,
-        "usable_context": fit.usable_context,
-        "use_case": fit.model.use_case,
-        "category": fit.use_case.label(),
-        "release_date": fit.model.release_date,
-        "license": fit.model.license,
-        "is_moe": fit.model.is_moe,
-        "fit_level": fit.fit_text(),
-        "run_mode": fit.run_mode_text(),
-        "score": round1(fit.score),
-        "score_components": {
-            "quality": round1(fit.score_components.quality),
-            "speed": round1(fit.score_components.speed),
-            "fit": round1(fit.score_components.fit),
-            "context": round1(fit.score_components.context),
-        },
-        "estimated_tps": round1(fit.estimated_tps),
-        "runtime": fit.runtime_text(),
-        "runtime_label": fit.runtime.label(),
-        "best_quant": fit.best_quant,
-        "disk_size_gb": round2(fit.model.estimate_disk_gb(&fit.best_quant)),
-        "memory_required_gb": round2(fit.memory_required_gb),
-        "memory_available_gb": round2(fit.memory_available_gb),
-        "moe_offloaded_gb": fit.moe_offloaded_gb.map(round2),
-        "total_memory_gb": round2(fit.memory_required_gb + fit.moe_offloaded_gb.unwrap_or(0.0)),
-        "utilization_pct": round1(fit.utilization_pct),
-        "notes": fit.notes,
-        "gguf_sources": fit.model.gguf_sources,
-        "installed": fit.installed,
-        "capabilities": fit.model.capabilities.iter().map(|c| c.label()).collect::<Vec<_>>(),
-        "capability_ids": serde_json::to_value(&fit.model.capabilities).unwrap(),
-        "ollama_name": ollama_name_for(&fit.model.name),
-        "estimate_basis": serde_json::to_value(&fit.estimate_basis).unwrap(),
-        "verify_command": generate_llamabench_command(fit),
-        "measured_tps": serde_json::to_value(&fit.measured_tps).unwrap(),
-    })
+    let mut value = crate::serve_shared::fit_to_json(fit);
+    let obj = value
+        .as_object_mut()
+        .expect("fit_to_json returns an object");
+    obj.insert("fit_level".to_string(), serde_json::json!(fit.fit_text()));
+    obj.insert(
+        "run_mode".to_string(),
+        serde_json::json!(fit.run_mode_text()),
+    );
+    obj.insert("runtime".to_string(), serde_json::json!(fit.runtime_text()));
+    obj.insert(
+        "capabilities".to_string(),
+        serde_json::json!(
+            fit.model
+                .capabilities
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+        ),
+    );
+    value
 }
 
 fn round1(v: f64) -> f64 {
@@ -1100,6 +1059,32 @@ mod tests {
             estimate_basis: Default::default(),
             measured_tps: None,
         }
+    }
+
+    #[test]
+    fn cli_json_keeps_legacy_vocab_while_shared_uses_codes() {
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        fit.model.capabilities = vec![Capability::ToolUse];
+
+        let cli = fit_to_json(&fit);
+        let shared = crate::serve_shared::fit_to_json(&fit);
+
+        // The CLI overlay preserves the human-readable values existing
+        // `fit --json` scripts depend on — unchanged from before the unification.
+        assert_eq!(cli["fit_level"], "Good");
+        assert_eq!(cli["run_mode"], "GPU");
+        assert_eq!(cli["runtime"], "llama.cpp");
+        assert_eq!(cli["capabilities"], serde_json::json!(["Tool Use"]));
+
+        // The shared (REST/MCP) envelope emits stable machine codes under the
+        // same keys, with the human string relocated to a `*_label` key.
+        assert_eq!(shared["fit_level"], "good");
+        assert_eq!(shared["fit_label"], "Good");
+        assert_eq!(shared["run_mode"], "gpu");
+        assert_eq!(shared["run_mode_label"], "GPU");
+        assert_eq!(shared["runtime"], "llamacpp");
+        assert_eq!(shared["runtime_label"], "llama.cpp");
+        assert_eq!(shared["capability_ids"], serde_json::json!(["tool_use"]));
     }
 
     #[test]

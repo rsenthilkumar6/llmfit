@@ -40,6 +40,8 @@ pub fn fit_to_json(fit: &ModelFit) -> serde_json::Value {
         "parameter_count": fit.model.parameter_count,
         "params_b": round2(fit.model.params_b()),
         "context_length": fit.model.context_length,
+        "usable_context": fit.usable_context,
+        "effective_context_length": fit.effective_context_length,
         "use_case": fit.model.use_case,
         "category": fit.use_case.label(),
         "release_date": fit.model.release_date,
@@ -67,8 +69,15 @@ pub fn fit_to_json(fit: &ModelFit) -> serde_json::Value {
         "notes": fit.notes,
         "gguf_sources": fit.model.gguf_sources,
         "capabilities": fit.model.capabilities,
+        "capability_ids": fit.model.capabilities,
         "license": fit.model.license,
         "supports_tp": fit.model.valid_tp_sizes(),
+        "installed": fit.installed,
+        "disk_size_gb": round2(fit.model.estimate_disk_gb(&fit.best_quant)),
+        "ollama_name": llmfit_core::providers::ollama_pull_tag(&fit.model.name),
+        "estimate_basis": fit.estimate_basis,
+        "verify_command": generate_llamabench_command(fit),
+        "measured_tps": fit.measured_tps,
     })
 }
 
@@ -98,6 +107,30 @@ pub fn runtime_code(runtime: InferenceRuntime) -> &'static str {
         InferenceRuntime::Vllm => "vllm",
         InferenceRuntime::Unsupported => "unsupported",
     }
+}
+
+/// llama-bench invocation that measures the same quantity `estimated_tps`
+/// models: single-request generation throughput (the `tg128` row). Prompt
+/// processing (`pp512`) is deliberately not what llmfit estimates.
+///
+/// Only emitted for pure-GPU and CPU-only runs — offload splits depend on
+/// llama.cpp's layer placement, which llama-bench can't express with a fixed
+/// `-ngl`, so a benchmark there wouldn't be comparable to the estimate.
+pub(crate) fn generate_llamabench_command(fit: &ModelFit) -> Option<String> {
+    if fit.runtime != InferenceRuntime::LlamaCpp {
+        return None;
+    }
+    let ngl = match fit.run_mode {
+        RunMode::Gpu => "99",
+        RunMode::CpuOnly => "0",
+        _ => return None,
+    };
+    // llama-bench needs a local GGUF path (no -hf support); point users at
+    // `llmfit download`, which prints the destination path.
+    Some(format!(
+        "llama-bench -m <path-to-{}-gguf> -ngl {} -p 512 -n 128",
+        fit.best_quant, ngl
+    ))
 }
 
 pub fn round1(v: f64) -> f64 {
@@ -151,5 +184,55 @@ mod tests {
         let gpu = &json["gpus"][0];
         assert!(gpu.get("memory_bandwidth_gbps").is_some());
         assert!(gpu["memory_bandwidth_gbps"].is_null());
+    }
+
+    #[test]
+    fn fit_json_exposes_context_fields() {
+        let db = llmfit_core::models::ModelDatabase::new();
+        let model = db
+            .get_all_models()
+            .iter()
+            .find(|m| m.context_length > llmfit_core::fit::DEFAULT_ESTIMATION_CTX)
+            .expect("catalog has a model with a large context window");
+        let fit = ModelFit::analyze(model, &specs_with_gpu("Tesla T4"));
+
+        let json = fit_to_json(&fit);
+
+        assert_eq!(json["usable_context"], fit.usable_context);
+        assert_eq!(
+            json["effective_context_length"],
+            llmfit_core::fit::DEFAULT_ESTIMATION_CTX
+        );
+        assert!(fit.usable_context <= model.context_length);
+    }
+
+    #[test]
+    fn fit_json_carries_formerly_cli_only_fields() {
+        let db = llmfit_core::models::ModelDatabase::new();
+        let model = db
+            .get_all_models()
+            .iter()
+            .next()
+            .expect("catalog is non-empty");
+        let fit = ModelFit::analyze(model, &specs_with_gpu("Tesla T4"));
+
+        let json = fit_to_json(&fit);
+
+        // Fields that used to live only in the CLI serializer now reach REST/MCP
+        // consumers through the shared envelope (issue #759).
+        for key in [
+            "installed",
+            "disk_size_gb",
+            "capability_ids",
+            "ollama_name",
+            "estimate_basis",
+            "verify_command",
+            "measured_tps",
+        ] {
+            assert!(
+                json.get(key).is_some(),
+                "shared envelope is missing `{key}`"
+            );
+        }
     }
 }

@@ -98,7 +98,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
-    let gpu_info = if app.specs.gpus.is_empty() {
+    // Browsing another card's leaderboard: temporarily stand in for the real
+    // GPU string so the bar can't be mistaken for the board being shown.
+    // Session-only state — never persisted, so it always resets on restart.
+    let gpu_info = if let Some(ref label) = app.bench_hw_label {
+        format!("GPU: [SIMULATED] {}", label)
+    } else if app.specs.gpus.is_empty() {
         format!("GPU: none ({})", app.specs.backend.label())
     } else {
         let primary = &app.specs.gpus[0];
@@ -266,7 +271,14 @@ fn draw_system_bar(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeColors) {
             Style::default().fg(tc.accent),
         ),
         Span::styled("  │  ", Style::default().fg(tc.muted)),
-        Span::styled(gpu_info, Style::default().fg(tc.accent_secondary)),
+        Span::styled(
+            gpu_info,
+            if app.bench_hw_label.is_some() {
+                Style::default().fg(tc.warning).bold()
+            } else {
+                Style::default().fg(tc.accent_secondary)
+            },
+        ),
     ]);
     let hardware_line = Line::from(hw_spans);
 
@@ -420,34 +432,45 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         ])
         .split(area);
 
-    // Search box
-    let search_style = match app.input_mode {
-        InputMode::Search => Style::default().fg(tc.accent_secondary),
-        InputMode::Normal
-        | InputMode::Plan
-        | InputMode::ProviderPopup
-        | InputMode::UseCasePopup
-        | InputMode::CapabilityPopup
-        | InputMode::DownloadProviderPopup
-        | InputMode::Visual
-        | InputMode::Select
-        | InputMode::QuantPopup
-        | InputMode::RunModePopup
-        | InputMode::ParamsBucketPopup
-        | InputMode::LicensePopup
-        | InputMode::RuntimePopup
-        | InputMode::HelpPopup
-        | InputMode::Simulation
-        | InputMode::AdvancedConfig
-        | InputMode::DownloadManager
-        | InputMode::FilterPopup
-        | InputMode::Benchmarks
-        | InputMode::BenchOffer => Style::default().fg(tc.muted),
+    // Search box — in the leaderboard view it shows the `/` benchmark search
+    let bench_search = app.input_mode == InputMode::Benchmarks
+        && (app.bench_search_active || !app.bench_search_query.is_empty());
+    let search_style = if bench_search && app.bench_search_active {
+        Style::default().fg(tc.accent_secondary)
+    } else {
+        match app.input_mode {
+            InputMode::Search => Style::default().fg(tc.accent_secondary),
+            InputMode::Normal
+            | InputMode::Plan
+            | InputMode::ProviderPopup
+            | InputMode::UseCasePopup
+            | InputMode::CapabilityPopup
+            | InputMode::DownloadProviderPopup
+            | InputMode::Visual
+            | InputMode::Select
+            | InputMode::QuantPopup
+            | InputMode::RunModePopup
+            | InputMode::ParamsBucketPopup
+            | InputMode::LicensePopup
+            | InputMode::RuntimePopup
+            | InputMode::HelpPopup
+            | InputMode::Simulation
+            | InputMode::AdvancedConfig
+            | InputMode::DownloadManager
+            | InputMode::FilterPopup
+            | InputMode::Benchmarks
+            | InputMode::BenchOffer => Style::default().fg(tc.muted),
+        }
     };
 
+    let (query, query_cursor) = if bench_search {
+        (&app.bench_search_query, app.bench_search_query.len())
+    } else {
+        (&app.search_query, app.cursor_position)
+    };
     let search_inner_width = chunks[0].width.saturating_sub(2) as usize;
     let (visible_query, cursor_offset) =
-        visible_search_query(&app.search_query, app.cursor_position, search_inner_width);
+        visible_search_query(query, query_cursor, search_inner_width);
 
     let search_text = if app.search_query.is_empty() && app.input_mode == InputMode::Normal {
         Line::from(Span::styled(
@@ -467,7 +490,7 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     let search = Paragraph::new(search_text).block(search_block);
     frame.render_widget(search, chunks[0]);
 
-    if app.input_mode == InputMode::Search {
+    if app.input_mode == InputMode::Search || (bench_search && app.bench_search_active) {
         frame.set_cursor_position((chunks[0].x + cursor_offset + 1, chunks[0].y + 1));
     }
 
@@ -577,10 +600,8 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
     frame.render_widget(sort_text, chunks[4]);
 
     // Fit + Filter indicator [f/F]
-    let has_range_filters = !app.filter_params_min_input.is_empty()
-        || !app.filter_params_max_input.is_empty()
-        || !app.filter_mem_pct_min_input.is_empty()
-        || !app.filter_mem_pct_max_input.is_empty();
+    let range_labels = app.advanced_range_labels();
+    let has_range_filters = !range_labels.is_empty();
 
     let fit_color = if has_range_filters || app.fit_filter != FitFilter::All {
         match app.fit_filter {
@@ -600,18 +621,20 @@ fn draw_search_and_filters(frame: &mut Frame, app: &App, area: Rect, tc: &ThemeC
         .title(" Fit [f] Filter [F] ")
         .title_style(Style::default().fg(tc.muted));
 
-    let mut parts: Vec<&str> = vec![app.fit_filter.label()];
-    if !app.filter_params_min_input.is_empty() || !app.filter_params_max_input.is_empty() {
-        parts.push("R");
-    }
-    if !app.filter_mem_pct_min_input.is_empty() || !app.filter_mem_pct_max_input.is_empty() {
-        parts.push("M");
-    }
-    let fit_text = Paragraph::new(Line::from(Span::styled(
-        parts.join(" "),
+    // Fit level label, then any active range filters spelled out (e.g.
+    // "≤2B") — a range from the F popup silently constrains every fit
+    // category, so it must be readable at a glance.
+    let mut fit_spans = vec![Span::styled(
+        app.fit_filter.label(),
         Style::default().fg(fit_color),
-    )))
-    .block(fit_block);
+    )];
+    for label in &range_labels {
+        fit_spans.push(Span::styled(
+            format!(" {}", label),
+            Style::default().fg(tc.warning).bold(),
+        ));
+    }
+    let fit_text = Paragraph::new(Line::from(fit_spans)).block(fit_block);
     frame.render_widget(fit_text, chunks[5]);
 
     // Availability filter
@@ -1016,10 +1039,17 @@ fn draw_table(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColors) {
 
     // Empty-state hint when filters hide all models
     if app.filtered_fits.is_empty() && !app.all_fits.is_empty() {
-        let hint = if app.has_advanced_filters_active() {
+        let ranges = app.advanced_range_labels();
+        let hint = if !ranges.is_empty() {
+            format!(
+                "No models match current filters — active range filter: {}. Press F to adjust, / to check search.",
+                ranges.join(", ")
+            )
+        } else if app.has_advanced_filters_active() {
             "No models match current filters. Press F to check advanced filters, / to check search."
+                .to_string()
         } else {
-            "No models match the selected fit level."
+            "No models match the selected fit level.".to_string()
         };
         let hint_paragraph = Paragraph::new(Line::from(Span::styled(
             hint,
@@ -3013,7 +3043,7 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             "SEARCH".to_string(),
         ),
         InputMode::Plan => (
-            "  Tab/jk:field  ←/→:cursor  type:edit  Backspace/Delete  Ctrl-U:clear  Esc:close"
+            "  Tab/↑↓:field  ←/→:cursor  type:edit  Backspace/Delete  Ctrl-U:clear  Esc:close"
                 .to_string(),
             "PLAN".to_string(),
         ),
@@ -3075,7 +3105,14 @@ fn status_keys_and_mode(app: &App) -> (String, String) {
             "FILTER".to_string(),
         ),
         InputMode::Benchmarks => (
-            " ↑/k:up  ↓/j:down  H:change GPU  r:refresh  b/q/Esc:close".to_string(),
+            if app.bench_search_active {
+                " type:filter  ↑↓:move  Enter:apply  Esc:clear".to_string()
+            } else if !app.bench_search_query.is_empty() {
+                " ↑/k:up  ↓/j:down  /:edit search  Esc:clear search  H:change GPU  r:refresh  b/q:close"
+                    .to_string()
+            } else {
+                " ↑/k:up  ↓/j:down  /:search  H:change GPU  r:refresh  b/q/Esc:close".to_string()
+            },
             "COMMUNITY LEADERBOARD".to_string(),
         ),
         InputMode::BenchOffer => (
@@ -3615,6 +3652,7 @@ fn draw_help_popup(frame: &mut Frame, app: &App, tc: &ThemeColors) {
             "Inference Bench (local quality scoring against your models)",
         ),
         ("  H", "Change GPU (in community leaderboard view)"),
+        ("  /", "Search results (in community leaderboard view)"),
         ("  y", "Copy model name"),
         ("", ""),
         ("Comparison", ""),
@@ -4448,9 +4486,28 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
     let mut summary_spans = vec![
         Span::styled("  Hardware: ", Style::default().fg(tc.muted)),
         Span::styled(&hw_desc, Style::default().fg(tc.fg).bold()),
-        Span::styled(counts, Style::default().fg(tc.muted)),
-        Span::styled("  H:change GPU", Style::default().fg(tc.accent)),
     ];
+    if app.bench_hw_label.is_some() {
+        summary_spans.push(Span::styled(
+            " [SIMULATED]",
+            Style::default().fg(tc.warning).bold(),
+        ));
+    }
+    summary_spans.push(Span::styled(counts, Style::default().fg(tc.muted)));
+    summary_spans.push(Span::styled(
+        "  H:change GPU",
+        Style::default().fg(tc.accent),
+    ));
+
+    // The query itself is typed into the Search box up top; here just the
+    // match count.
+    let visible = app.bench_visible_indices();
+    if app.bench_search_active || !app.bench_search_query.is_empty() {
+        summary_spans.push(Span::styled(
+            format!("  {}/{} match", visible.len(), app.bench_entries.len()),
+            Style::default().fg(tc.accent).bold(),
+        ));
+    }
     if let Some(ref err) = app.bench_error {
         summary_spans.push(Span::styled(
             format!("  ⚠ {}", err),
@@ -4481,21 +4538,24 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
     .height(1);
 
     let visible_height = inner.height.saturating_sub(3) as usize; // 1 summary + 1 header + 1 spacing
-    // Adjust scroll to keep cursor visible
+    // The cursor indexes into the filtered list; keep it valid and visible.
+    if !visible.is_empty() && app.bench_cursor >= visible.len() {
+        app.bench_cursor = visible.len() - 1;
+    }
     if app.bench_cursor < app.bench_scroll {
         app.bench_scroll = app.bench_cursor;
     } else if app.bench_cursor >= app.bench_scroll + visible_height {
         app.bench_scroll = app.bench_cursor.saturating_sub(visible_height - 1);
     }
 
-    let rows: Vec<Row> = app
-        .bench_entries
+    let rows: Vec<Row> = visible
         .iter()
         .enumerate()
         .skip(app.bench_scroll)
         .take(visible_height)
-        .map(|(i, entry)| {
-            let is_selected = i == app.bench_cursor;
+        .map(|(vi, &i)| {
+            let entry = &app.bench_entries[i];
+            let is_selected = vi == app.bench_cursor;
             let style = if is_selected {
                 Style::default().bg(tc.highlight_bg).fg(tc.fg)
             } else {
@@ -4582,7 +4642,22 @@ fn draw_benchmarks(frame: &mut Frame, app: &mut App, area: Rect, tc: &ThemeColor
         .split(inner);
 
     frame.render_widget(Paragraph::new(summary), chunks[0]);
-    frame.render_widget(table, chunks[1]);
+    if visible.is_empty() && !app.bench_search_query.is_empty() {
+        let no_match = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  No results match /{}", app.bench_search_query),
+                Style::default().fg(tc.muted),
+            )),
+            Line::from(Span::styled(
+                "  Esc to clear the search",
+                Style::default().fg(tc.muted),
+            )),
+        ]);
+        frame.render_widget(no_match, chunks[1]);
+    } else {
+        frame.render_widget(table, chunks[1]);
+    }
 
     // Draw hardware picker popup overlay if open
     if app.bench_hw_picker_open {

@@ -1279,6 +1279,7 @@ fn run_tui_inner(
 
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
+
     draw_boot_screen(&mut terminal, "Detecting system hardware...")?;
 
     // Create app state (provider detection runs in background threads)
@@ -1291,6 +1292,13 @@ fn run_tui_inner(
     if open_bench {
         app.open_bench();
     }
+
+    // Force a full clear AFTER the first drawn frame (the boot screen), not
+    // before it: on some terminals (notably Windows Terminal, #732) a clear()
+    // issued before any draw is a no-op, so clearing here — after the backend
+    // has drawn once — is what actually removes the previous shell content
+    // that EnterAlternateScreen leaves visible under sparse frames.
+    terminal.clear()?;
 
     // Main loop
     loop {
